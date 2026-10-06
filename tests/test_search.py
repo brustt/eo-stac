@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import warnings
 from datetime import datetime, timezone
 
 import geopandas as gpd
@@ -9,7 +11,8 @@ import pytest
 import responses as resp_lib
 
 from eostac.catalog import STACSource
-from eostac.params import OpticalParams
+from eostac.exceptions import SearchError
+from eostac.params import OpticalParams, Sentinel1Params
 from eostac.search import (
     _items_to_gdf,
     _normalize_datetime,
@@ -21,6 +24,7 @@ from tests.conftest import (
     FAKE_CONFORMANCE,
     FAKE_LANDING,
     make_fake_search_response,
+    make_item,
 )
 
 # ---------------------------------------------------------------------------
@@ -89,10 +93,18 @@ def test_normalize_datetime_tuple_of_datetimes() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _setup_api_mocks(items=None) -> None:
-    resp_lib.add(resp_lib.GET, FAKE_API_URL, json=FAKE_LANDING, status=200)
+_FILTER_CONFORMANCE = "https://api.stacspec.org/v1.0.0/item-search#filter"
+
+
+def _setup_api_mocks(items=None, with_filter: bool = False) -> None:
+    landing, conformance = FAKE_LANDING, FAKE_CONFORMANCE
+    if with_filter:
+        conforms_to = [*FAKE_CONFORMANCE["conformsTo"], _FILTER_CONFORMANCE]
+        landing = {**FAKE_LANDING, "conformsTo": conforms_to}
+        conformance = {"conformsTo": conforms_to}
+    resp_lib.add(resp_lib.GET, FAKE_API_URL, json=landing, status=200)
     resp_lib.add(
-        resp_lib.GET, f"{FAKE_API_URL}/conformance", json=FAKE_CONFORMANCE, status=200
+        resp_lib.GET, f"{FAKE_API_URL}/conformance", json=conformance, status=200
     )
     resp_lib.add(
         resp_lib.GET, f"{FAKE_API_URL}/collections", json=FAKE_COLLECTIONS, status=200
@@ -158,3 +170,110 @@ def test_search_api_params_pushed_as_query() -> None:
     payload = body.decode() if isinstance(body, (bytes, bytearray)) else body
     assert "eo:cloud_cover" in payload
     assert "lte" in payload
+
+
+def _post_bodies() -> list[dict]:
+    posts = [c for c in resp_lib.calls if c.request.method == "POST"]
+    return [json.loads(c.request.body) for c in posts]
+
+
+@pytest.mark.unit
+def test_items_to_gdf_keeps_asset_roles(sample_item) -> None:
+    gdf = _items_to_gdf([sample_item])
+    assert gdf.iloc[0]["asset_roles"] == {
+        "B04": ["data"],
+        "B03": ["data"],
+        "thumbnail": ["thumbnail"],
+    }
+
+
+@pytest.mark.unit
+@resp_lib.activate
+def test_extra_query_overrides_params_per_property() -> None:
+    _setup_api_mocks()
+    source = STACSource.from_url(FAKE_API_URL)
+    search_items(
+        source,
+        params=Sentinel1Params(platform="SENTINEL-1A", orbit_state="ascending"),
+        extra_query={"platform": {"eq": "sentinel-1a"}, "s1:slice_number": {"eq": 3}},
+    )
+    assert _post_bodies()[-1]["query"] == {
+        "platform": {"eq": "sentinel-1a"},
+        "sat:orbit_state": {"eq": "ascending"},
+        "s1:slice_number": {"eq": 3},
+    }
+
+
+@pytest.mark.unit
+@resp_lib.activate
+def test_polarizations_sent_as_cql2_filter() -> None:
+    _setup_api_mocks(with_filter=True)
+    source = STACSource.from_url(FAKE_API_URL)
+    search_items(
+        source,
+        params=Sentinel1Params(polarizations=["VV", "VH"], orbit_state="ascending"),
+    )
+    body = _post_bodies()[-1]
+    assert "query" not in body
+    assert body["filter-lang"] == "cql2-json"
+    assert body["filter"] == {
+        "op": "and",
+        "args": [
+            {"op": "=", "args": [{"property": "sat:orbit_state"}, "ascending"]},
+            {
+                "op": "a_contains",
+                "args": [{"property": "sar:polarizations"}, ["VV", "VH"]],
+            },
+        ],
+    }
+
+
+@pytest.mark.unit
+@resp_lib.activate
+def test_polarizations_without_filter_support_raises() -> None:
+    _setup_api_mocks()
+    source = STACSource.from_url(FAKE_API_URL)
+    with pytest.raises(SearchError, match="sar:polarizations"):
+        search_items(source, params=Sentinel1Params(polarizations=["VV"]))
+
+
+def _setup_filtered_empty_then_sample(sample_items) -> None:
+    """Landing mocks, then POST /search: first response empty, second the sample."""
+    resp_lib.add(resp_lib.GET, FAKE_API_URL, json=FAKE_LANDING, status=200)
+    resp_lib.add(
+        resp_lib.GET, f"{FAKE_API_URL}/conformance", json=FAKE_CONFORMANCE, status=200
+    )
+    resp_lib.add(
+        resp_lib.POST,
+        f"{FAKE_API_URL}/search",
+        json=make_fake_search_response([]),
+        status=200,
+    )
+    resp_lib.add(
+        resp_lib.POST,
+        f"{FAKE_API_URL}/search",
+        json=make_fake_search_response(sample_items),
+        status=200,
+    )
+
+
+@pytest.mark.unit
+@resp_lib.activate
+def test_zero_results_warns_naming_missing_property() -> None:
+    _setup_filtered_empty_then_sample([make_item()])
+    source = STACSource.from_url(FAKE_API_URL)
+    with pytest.warns(UserWarning, match="sar:product_type"):
+        gdf = search_items(source, params=Sentinel1Params(product_type="GRD"))
+    assert len(gdf) == 0
+    assert "query" not in _post_bodies()[-1]
+
+
+@pytest.mark.unit
+@resp_lib.activate
+def test_zero_results_no_warning_when_property_exists() -> None:
+    _setup_filtered_empty_then_sample([make_item()])
+    source = STACSource.from_url(FAKE_API_URL)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        gdf = search_items(source, params=OpticalParams(max_cloud_cover=1))
+    assert len(gdf) == 0

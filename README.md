@@ -1,6 +1,6 @@
 # eostac
 
-A Python library for searching and downloading satellite imagery via STAC (SpatioTemporal Asset Catalog). Works with any STAC-compliant catalog — static JSON files or HTTP APIs — and returns structured GeoDataFrame results with concurrent downloads and folium-based visualization.
+A Python library for searching and downloading satellite imagery via STAC (SpatioTemporal Asset Catalog). Works with any STAC API (HTTP/HTTPS) from any provider — Earth Search, Planetary Computer, CDSE, … — and returns structured GeoDataFrame results with concurrent downloads and folium-based visualization.
 
 ## Installation
 
@@ -11,7 +11,7 @@ uv sync
 ## Quick start
 
 ```python
-from eostac import STACSource, search_items, download_items, viz
+from eostac import STACSource, Sentinel2Params, search_items, download_items, viz
 
 # Connect to a STAC API
 source = STACSource.from_url("https://earth-search.aws.element84.com/v1")
@@ -22,7 +22,7 @@ gdf = search_items(
     collections=["sentinel-2-l2a"],
     bbox=[10.0, 45.0, 12.0, 47.0],
     datetime="2020-06-01/2020-09-01",
-    max_cloud_cover=20.0,
+    params=Sentinel2Params(max_cloud_cover=20.0),
 )
 
 # Download assets
@@ -33,23 +33,50 @@ m = viz.plot_footprints(gdf, column="cloud_cover")
 m.save("map.html")
 ```
 
+### Sentinel-1 from Planetary Computer
+
+Planetary Computer asset hrefs must be signed with a short-lived token. Install
+its signing package (`uv add planetary-computer`) and pass its `sign` function
+at download time — search results keep plain, non-expiring hrefs.
+
+```python
+import planetary_computer
+from eostac import STACSource, Sentinel1Params, search_items, download_items
+
+source = STACSource.from_url("https://planetarycomputer.microsoft.com/api/stac/v1")
+
+gdf = search_items(
+    source,
+    collections=["sentinel-1-grd"],
+    bbox=[2.2, 48.8, 2.5, 48.9],
+    datetime="2024-06-01/2024-06-20",
+    params=Sentinel1Params(
+        orbit_state="ascending",
+        instrument_mode="IW",
+        polarizations=["VV", "VH"],  # items carrying at least VV and VH
+    ),
+)
+
+gdf = download_items(
+    gdf,
+    output_dir="downloads/",
+    assets=["vv", "vh"],
+    sign=planetary_computer.sign,
+)
+```
+
 ## API
 
 ### `STACSource`
 
-Unified entry point for STAC APIs and static catalogs.
+Entry point for a STAC API. Static catalogs and local paths are not supported.
 
 ```python
-# STAC API (pystac-client)
 source = STACSource.from_url("https://...")
 
 # With authentication
 source = STACSource.from_url("https://...", headers={"Authorization": "Bearer TOKEN"})
 
-# Local static catalog
-source = STACSource.from_json("path/to/catalog.json")
-
-source.is_api        # True for STAC APIs, False for static catalogs
 source.collections   # list of collection IDs
 ```
 
@@ -62,15 +89,19 @@ gdf = search_items(
     bbox=[west, south, east, north],  # spatial filter
     polygon=shapely_geom,             # alternative spatial filter (GeoJSON dict or Shapely)
     datetime="2020-01-01/2020-12-31", # temporal filter (ISO-8601 range or (start, end) tuple)
-    max_cloud_cover=20.0,             # 0–100
-    product_type="L2A",
+    params=Sentinel2Params(max_cloud_cover=20.0),   # sensor-specific filters
+    extra_query={"s2:mgrs_tile": {"eq": "32TQM"}},  # raw provider-specific filters
     limit=100,
 )
 ```
 
-Returns a `GeoDataFrame` with columns: `geometry`, `item_id`, `collection`, `datetime`, `cloud_cover`, `assets` (dict of key → href), plus all other flattened STAC properties.
+Returns a `GeoDataFrame` with columns: `geometry`, `item_id`, `collection`, `datetime`, `cloud_cover`, `assets` (dict of key → href), `asset_roles` (dict of key → STAC roles), plus all other flattened STAC properties.
 
-Filters are pushed server-side for STAC APIs. For static catalogs, filtering is applied client-side by walking all items.
+`params` takes a `SearchParams` subclass: `Sentinel2Params`, `LandsatParams`, `Sentinel1Params`, `DEMParams` (or the generic `OpticalParams` / `SARParams`). All filtering happens server-side.
+
+Property names differ between providers. `extra_query` is a raw STAC query-extension dict (`{property: {operator: value}}`) for anything provider-specific; it overrides `params` per property. If a filtered search returns nothing because the provider's items do not carry a filtered property, a warning names that property.
+
+`SARParams.polarizations` is sent as a CQL2 filter; a `SearchError` is raised if the API does not support the filter extension.
 
 ### `download_items()`
 
@@ -80,11 +111,12 @@ Downloads run concurrently via `asyncio` and `httpx`. All assets start immediate
 gdf = download_items(
     gdf,
     output_dir="downloads/",
-    assets=["B04", "B03"],  # None → all assets
+    assets=["B04", "B03"],  # band aliases ("red") or asset keys; None → all downloadable assets
     max_workers=4,          # max concurrent downloads (async semaphore)
     overwrite=False,        # skip existing files by default
     process=False,          # True → re-encode as COG GeoTIFF via rioxarray
     show_progress=True,
+    sign=None,              # href → href callable for providers needing signed URLs
 )
 # gdf now has a 'local_paths' column: dict of asset_key → Path
 ```
@@ -118,11 +150,11 @@ pm.metadata_path("my_search")                       # → Path
 from eostac import viz
 
 viz.plot_footprints(gdf, column="cloud_cover")  # footprints coloured by column
-viz.plot_thumbnails(gdf, max_items=9)           # thumbnail image overlays
+viz.plot_thumbnails(gdf, max_items=9)           # thumbnail image overlays (accepts sign=)
 viz.quick_view("path/to/raster.tif", band_indices=[3, 2, 1])  # raster preview
 ```
 
-All functions return a `folium.Map`.
+All functions return a `folium.Map`. `plot_thumbnails` and `quick_view` accept the same `sign` callable as `download_items`.
 
 ## Development
 

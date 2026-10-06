@@ -67,6 +67,12 @@ def test_plot_thumbnails_returns_map(sample_gdf) -> None:
 
 
 @pytest.mark.unit
+def test_plot_thumbnails_signs_hrefs(sample_gdf) -> None:
+    m = plot_thumbnails(sample_gdf, sign=lambda href: f"{href}?token=abc")
+    assert "thumb.jpg?token=abc" in m.get_root().render()
+
+
+@pytest.mark.unit
 def test_plot_thumbnails_max_items(sample_gdf) -> None:
     m = plot_thumbnails(sample_gdf, max_items=1)
     assert isinstance(m, folium.Map)

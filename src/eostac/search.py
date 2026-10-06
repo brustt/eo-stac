@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from datetime import datetime as dt
 from typing import TYPE_CHECKING, Any, Union
 
@@ -27,6 +28,7 @@ def search_items(
     datetime: str | tuple | None = None,
     limit: int | None = None,
     params: SearchParams | None = None,
+    extra_query: dict[str, dict] | None = None,
 ) -> gpd.GeoDataFrame:
     """Search a STAC API and return matching items as a GeoDataFrame.
 
@@ -50,29 +52,48 @@ def search_items(
         Sensor-specific filter params.  Pass a subclass of
         :class:`~eostac.params.SearchParams` — e.g.
         ``Sentinel2Params(max_cloud_cover=20)``,
-        ``Sentinel1Params(orbit_direction="ascending")``.  Its
+        ``Sentinel1Params(orbit_state="ascending")``.  Its
         :meth:`~eostac.params.SearchParams.to_query` output is pushed to the
-        server via the STAC query extension.
+        server via the STAC query extension.  Filters the query extension
+        cannot express (``polarizations``) are sent as a CQL2 filter instead;
+        :class:`~eostac.exceptions.SearchError` is raised if the API does not
+        support it.
+    extra_query:
+        Raw STAC query-extension dict (``{property: {operator: value}}``) for
+        provider-specific properties.  Overrides *params* per property.
+
+    Warns
+    -----
+    UserWarning
+        When a filtered search returns no items and a filtered property is
+        absent from the items the same search returns without filters.
 
     Returns
     -------
     geopandas.GeoDataFrame
         Columns: ``geometry``, ``item_id``, ``collection``, ``datetime``,
-        ``cloud_cover`` (normalised 0–100 if present), ``assets`` (dict), plus
-        all other flattened STAC properties.
+        ``cloud_cover`` (normalised 0–100 if present), ``assets`` (dict of
+        key → href), ``asset_roles`` (dict of key → roles), plus all other
+        flattened STAC properties.
     """
-    query = params.to_query() if params is not None else None
+    query = {**(params.to_query() if params is not None else {}), **(extra_query or {})}
+    predicates = params.to_filter() if params is not None else []
+    spatiotemporal = dict(
+        collections=collections, bbox=bbox, polygon=polygon, datetime=datetime
+    )
 
     try:
         items = _search_api(
             source._client,
-            collections=collections,
-            bbox=bbox,
-            polygon=polygon,
-            datetime=datetime,
+            **spatiotemporal,
             limit=limit,
             query=query,
+            predicates=predicates,
         )
+        if not items and (query or predicates):
+            _warn_missing_properties(source._client, spatiotemporal, query, predicates)
+    except SearchError:
+        raise
     except Exception as exc:
         raise SearchError(str(exc)) from exc
 
@@ -109,6 +130,7 @@ def _search_api(
     datetime: str | tuple | None,
     limit: int | None,
     query: dict[str, dict] | None,
+    predicates: list[dict] | None = None,
 ) -> list[pystac.Item]:
     kwargs: dict[str, Any] = {}
 
@@ -122,11 +144,81 @@ def _search_api(
         kwargs["datetime"] = _normalize_datetime(datetime)
     if limit is not None:
         kwargs["max_items"] = limit
-    if query:
+    if predicates:
+        # A request carries either a query or a filter, never both: once a CQL2
+        # predicate is needed, the query-extension filters are expressed as CQL2 too.
+        if not client.conforms_to("FILTER"):
+            props = ", ".join(sorted(_predicate_properties(predicates)))
+            raise SearchError(
+                f"This STAC API does not support the filter extension (CQL2), "
+                f"required to filter on: {props}."
+            )
+        args = _query_to_cql2(query or {}) + predicates
+        kwargs["filter"] = args[0] if len(args) == 1 else {"op": "and", "args": args}
+        kwargs["filter_lang"] = "cql2-json"
+    elif query:
         kwargs["query"] = query
 
     search = client.search(**kwargs)
     return list(search.items())
+
+
+_QUERY_TO_CQL2_OPS = {
+    "eq": "=",
+    "neq": "<>",
+    "lt": "<",
+    "lte": "<=",
+    "gt": ">",
+    "gte": ">=",
+    "in": "in",
+}
+
+
+def _query_to_cql2(query: dict[str, dict]) -> list[dict]:
+    """Translate a STAC query-extension dict into a list of CQL2-JSON predicates."""
+    predicates = []
+    for prop, ops in query.items():
+        for op, value in ops.items():
+            if op not in _QUERY_TO_CQL2_OPS:
+                raise SearchError(
+                    f"Query operator {op!r} on {prop!r} cannot be combined "
+                    f"with a CQL2 filter."
+                )
+            predicates.append(
+                {"op": _QUERY_TO_CQL2_OPS[op], "args": [{"property": prop}, value]}
+            )
+    return predicates
+
+
+def _predicate_properties(predicates: list[dict]) -> set[str]:
+    return {
+        arg["property"]
+        for predicate in predicates
+        for arg in predicate.get("args", [])
+        if isinstance(arg, dict) and "property" in arg
+    }
+
+
+def _warn_missing_properties(
+    client: pystac_client.Client,
+    spatiotemporal: dict[str, Any],
+    query: dict[str, dict],
+    predicates: list[dict],
+) -> None:
+    """Warn when a filtered property is absent from an unfiltered sample item."""
+    sample = _search_api(client, **spatiotemporal, limit=1, query=None)
+    if not sample:
+        return
+    available = sample[0].properties or {}
+    filtered = set(query) | _predicate_properties(predicates)
+    missing = sorted(prop for prop in filtered if prop not in available)
+    if missing:
+        warnings.warn(
+            f"Search returned no items. Filtered properties not carried by items "
+            f"of this source: {missing!r}. Use extra_query with the provider's "
+            f"property names.",
+            stacklevel=3,
+        )
 
 
 def _normalize_cloud_cover(val: Union[int, float]) -> float:
@@ -146,7 +238,14 @@ def _get_cloud_cover(props: dict) -> float | None:
 
 
 # Universal STAC item fields present regardless of sensor.
-_CORE_COLUMNS = ["geometry", "item_id", "collection", "datetime", "assets"]
+_CORE_COLUMNS = [
+    "geometry",
+    "item_id",
+    "collection",
+    "datetime",
+    "assets",
+    "asset_roles",
+]
 
 # Cloud-cover appears under several raw keys; all normalise to a 0–100 ``cloud_cover``.
 _CLOUD_COVER_KEYS = ("eo:cloud_cover", "cloud_cover", "cloudCover")
@@ -165,6 +264,9 @@ def _items_to_gdf(items: list[pystac.Item]) -> gpd.GeoDataFrame:
         props = item.properties or {}
         geom = shape(item.geometry) if item.geometry else None
         assets = {key: asset.href for key, asset in item.assets.items()}
+        asset_roles = {
+            key: list(asset.roles or []) for key, asset in item.assets.items()
+        }
 
         row: dict[str, object] = {
             "geometry": geom,
@@ -172,6 +274,7 @@ def _items_to_gdf(items: list[pystac.Item]) -> gpd.GeoDataFrame:
             "collection": item.collection_id,
             "datetime": item.datetime,
             "assets": assets,
+            "asset_roles": asset_roles,
         }
 
         # Flatten every property under its namespace-stripped name, so the schema

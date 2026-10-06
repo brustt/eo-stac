@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import folium
@@ -84,6 +85,7 @@ def plot_footprints(
 def plot_thumbnails(
     gdf: gpd.GeoDataFrame,
     max_items: int = 9,
+    sign: Callable[[str], str] | None = None,
 ) -> folium.Map:
     """Overlay thumbnail images on a folium map.
 
@@ -96,6 +98,9 @@ def plot_thumbnails(
         GeoDataFrame from :func:`~eostac.search.search_items`.
     max_items:
         Maximum number of items to display.
+    sign:
+        Callable turning a thumbnail href into a fetchable one, for providers
+        whose hrefs need a token (e.g. ``planetary_computer.sign``).
 
     Returns
     -------
@@ -117,6 +122,8 @@ def plot_thumbnails(
 
         assets: dict = row.get("assets") or {}
         thumb_href = assets.get("thumbnail") or assets.get("visual")
+        if thumb_href and sign is not None:
+            thumb_href = sign(thumb_href)
 
         bounds = geom.bounds  # (minx, miny, maxx, maxy)
         img_bounds = [[bounds[1], bounds[0]], [bounds[3], bounds[2]]]
@@ -143,6 +150,7 @@ def quick_view(
     path_or_href: str | Path,
     band_indices: list[int] | None = None,
     overview_level: int | None = 2,
+    sign: Callable[[str], str] | None = None,
 ) -> folium.Map:
     """Open a raster at a reduced overview and render it on a folium map.
 
@@ -155,6 +163,9 @@ def quick_view(
         ``None`` loads the first band.
     overview_level:
         Overview pyramid level (higher = smaller/faster).
+    sign:
+        Callable turning a remote href into a fetchable one, for providers
+        whose hrefs need a token (e.g. ``planetary_computer.sign``).
 
     Returns
     -------
@@ -168,6 +179,8 @@ def quick_view(
     from PIL import Image
 
     href = str(path_or_href)
+    if sign is not None:
+        href = sign(href)
     open_kwargs: dict[str, object] = {}
     if overview_level is not None:
         open_kwargs["overview_level"] = overview_level

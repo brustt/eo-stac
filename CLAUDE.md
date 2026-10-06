@@ -46,9 +46,9 @@ src/eostac/
 
 - **`STACSource`** (`catalog.py`) — wraps a `pystac_client.Client` (STAC API). Use `from_url()` with an HTTP/HTTPS endpoint. Local paths and `file://` URLs are rejected (`EostacError`); static catalogs are not supported.
 
-- **`search_items(source, ...)`** (`search.py`) — queries the API with optional bbox/polygon/datetime filters plus sensor-specific `params` (a `SearchParams` subclass). All filtering is pushed to the server: `params.to_query()` produces a STAC query-extension dict — there is no client-side filtering. Returns a `geopandas.GeoDataFrame` with columns: `geometry`, `item_id`, `collection`, `datetime`, `cloud_cover`, `assets` (dict), plus flattened STAC properties.
+- **`search_items(source, ...)`** (`search.py`) — queries the API with optional bbox/polygon/datetime filters plus sensor-specific `params` (a `SearchParams` subclass) and a raw `extra_query` dict for provider-specific properties (overrides `params` per property). All filtering is pushed to the server: `params.to_query()` produces a STAC query-extension dict and `params.to_filter()` CQL2 predicates for what the query extension cannot express (SAR `polarizations`); when predicates are present the whole request is sent as one CQL2 filter (`SearchError` if the API lacks the filter extension). There is no client-side filtering. On zero results, one unfiltered sample item is fetched to warn about filtered properties the provider does not carry. Returns a `geopandas.GeoDataFrame` with columns: `geometry`, `item_id`, `collection`, `datetime`, `cloud_cover`, `assets` (key → href), `asset_roles` (key → roles), plus flattened STAC properties.
 
-- **`download_items(gdf, output_dir, ...)`** (`download.py`) — concurrent download via `asyncio` and `httpx.AsyncClient`. Concurrency is bounded by `asyncio.Semaphore(max_workers)`. Supports resume (skip existing files), overwrite, raw streaming, or COG re-encoding via rioxarray (offloaded to a worker thread with `asyncio.to_thread`). Returns the GDF with a `local_paths` column added. Always saves a GeoPackage to `output_dir/metadata/`.
+- **`download_items(gdf, output_dir, ...)`** (`download.py`) — concurrent download via `asyncio` and `httpx.AsyncClient`. Concurrency is bounded by `asyncio.Semaphore(max_workers)`. Supports resume (skip existing files), overwrite, raw streaming, or COG re-encoding via rioxarray (offloaded to a worker thread with `asyncio.to_thread`). A caller-supplied `sign` callable (href → href, e.g. `planetary_computer.sign`) is applied just before each fetch; the GDF keeps unsigned hrefs. `assets=None` downloads every asset except those with the `tiles` role. Returns the GDF with a `local_paths` column added. Always saves a GeoPackage to `output_dir/metadata/`.
 
 - **`PathManager`** (`storage.py`) — resolves deterministic paths under a root:
   ```
@@ -63,6 +63,7 @@ src/eostac/
 
 ### Key design decisions
 
+- **Provider-agnostic** — the library names no provider; signing and odd property names come from the caller (`sign`, `extra_query`). See `CONTEXT.md` and `docs/adr/`
 - **Async not threads** — downloads are I/O bound; `asyncio` + `httpx.AsyncClient` avoids thread overhead; all tasks start immediately, bounded by `Semaphore(max_workers)`
 - **Retry with backoff** — `_download_raw` retries 3× with exponential delay (`await asyncio.sleep(2^n)`)
 - **Server-side filtering only** — sensor filters are pushed via the STAC query extension (`SearchParams.to_query()`); the client never re-filters returned items

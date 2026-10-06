@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -20,6 +21,9 @@ from eostac.storage import PathManager
 _RETRY_COUNT = 3
 _CHUNK_SIZE = 1 << 20  # 1 MiB
 
+# Roles marking an asset as a service endpoint rather than a downloadable file.
+_NON_DOWNLOADABLE_ROLES = frozenset({"tiles"})
+
 
 def download_items(
     gdf: gpd.GeoDataFrame,
@@ -30,6 +34,7 @@ def download_items(
     process: bool = False,
     show_progress: bool = True,
     extra_aliases: dict[str, list[str]] | None = None,
+    sign: Callable[[str], str] | None = None,
 ) -> gpd.GeoDataFrame:
     """Download assets for every item in *gdf*.
 
@@ -42,7 +47,8 @@ def download_items(
     assets:
         Band Aliases or raw Asset Keys to download.  Resolution tries the
         built-in Alias Table first, then the value as a literal Asset Key.
-        ``None`` downloads all assets without alias resolution.
+        ``None`` downloads every downloadable asset (all but those with the
+        ``tiles`` role) without alias resolution.
     max_workers:
         Maximum number of concurrent downloads (semaphore size).
     overwrite:
@@ -55,6 +61,10 @@ def download_items(
     extra_aliases:
         Extra entries merged on top of the built-in Alias Table.
         Format: ``{"alias": ["candidate_key1", "candidate_key2"]}``.
+    sign:
+        Callable turning an asset href into a fetchable one, applied just
+        before each download — for providers whose hrefs need a short-lived
+        token (e.g. ``planetary_computer.sign``).
 
     Returns
     -------
@@ -64,7 +74,7 @@ def download_items(
     """
     coro = _download_items_async(
         gdf, output_dir, assets, max_workers, overwrite, process, show_progress,
-        extra_aliases,
+        extra_aliases, sign,
     )
     try:
         asyncio.get_running_loop()
@@ -83,6 +93,7 @@ async def _download_items_async(
     process: bool = False,
     show_progress: bool = True,
     extra_aliases: dict[str, list[str]] | None = None,
+    sign: Callable[[str], str] | None = None,
 ) -> gpd.GeoDataFrame:
     pm = PathManager(output_dir)
     gdf = gdf.copy()
@@ -91,7 +102,13 @@ async def _download_items_async(
     tasks: list[tuple[int, str, str, Path]] = []
     for idx, row in gdf.iterrows():
         item_assets: dict[str, str] = row.get("assets") or {}
-        selected = _select_assets(item_assets, assets, extra_aliases, row.get("item_id", str(idx)))
+        selected = _select_assets(
+            item_assets,
+            assets,
+            extra_aliases,
+            row.get("item_id", str(idx)),
+            row.get("asset_roles") or {},
+        )
 
         item_id = row.get("item_id", str(idx))
         collection = row.get("collection") or "unknown"
@@ -102,7 +119,9 @@ async def _download_items_async(
             dest = pm.asset_path(collection, item_id, item_dt, key, suffix=suffix)
             tasks.append((idx, key, href, dest))
 
-    results, errors = await _run_downloads(tasks, process, max_workers, overwrite, show_progress)
+    results, errors = await _run_downloads(
+        tasks, process, max_workers, overwrite, show_progress, sign
+    )
 
     for (row_idx, key), local_path in results.items():
         gdf.at[row_idx, "local_paths"][key] = local_path
@@ -131,17 +150,24 @@ def _select_assets(
     requested: list[str] | None,
     extra_aliases: dict[str, list[str]] | None,
     item_id: str,
+    asset_roles: dict[str, list[str]] | None = None,
 ) -> dict[str, str]:
     """Return resolved ``{alias_or_key: href}`` dict.
 
-    When *requested* is ``None``, returns all assets without Resolution.
+    When *requested* is ``None``, returns every downloadable asset (those whose
+    roles in *asset_roles* do not mark a service endpoint) without Resolution.
     Raises :exc:`~eostac.exceptions.DownloadError` if any requested alias or
     key cannot be resolved against *item_assets*.
     """
     if not item_assets:
         return {}
     if requested is None:
-        return item_assets
+        roles = asset_roles or {}
+        return {
+            key: href
+            for key, href in item_assets.items()
+            if not _NON_DOWNLOADABLE_ROLES.intersection(roles.get(key) or [])
+        }
 
     result: dict[str, str] = {}
     missing: list[str] = []
@@ -174,6 +200,7 @@ async def _run_downloads(
     max_workers: int,
     overwrite: bool,
     show_progress: bool,
+    sign: Callable[[str], str] | None = None,
 ) -> tuple[dict[tuple[int, str], Path], list[str]]:
     results: dict[tuple[int, str], Path] = {}
     errors: list[str] = []
@@ -183,6 +210,11 @@ async def _run_downloads(
 
         async def run_one(row_idx: int, key: str, href: str, dest: Path) -> tuple:
             async with sem:
+                if sign is not None and (overwrite or not dest.exists()):
+                    try:
+                        href = await asyncio.to_thread(sign, href)
+                    except Exception as exc:
+                        raise DownloadError(f"Failed to sign {href}: {exc}") from exc
                 if process:
                     path = await asyncio.to_thread(
                         _download_processed_sync, href, dest, overwrite
@@ -283,7 +315,9 @@ def _download_processed_sync(href: str, dest: Path, overwrite: bool = False) -> 
 def _save_metadata(gdf: gpd.GeoDataFrame, path: Path) -> None:
     try:
         serialisable = gdf.drop(
-            columns=[c for c in ("assets", "local_paths") if c in gdf.columns],
+            columns=[
+                c for c in ("assets", "asset_roles", "local_paths") if c in gdf.columns
+            ],
             errors="ignore",
         )
         serialisable.to_file(str(path), driver="GPKG")

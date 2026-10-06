@@ -52,6 +52,25 @@ def test_select_assets_all_when_none() -> None:
 
 
 @pytest.mark.unit
+def test_select_assets_none_skips_tiles_role() -> None:
+    assets = {"vv": "url_vv", "tilejson": "url_tiles", "thumbnail": "url_thumb"}
+    roles = {"vv": ["data"], "tilejson": ["tiles"], "thumbnail": ["thumbnail"]}
+    assert _select_assets(assets, None, None, "item-1", roles) == {
+        "vv": "url_vv",
+        "thumbnail": "url_thumb",
+    }
+
+
+@pytest.mark.unit
+def test_select_assets_explicit_key_ignores_roles() -> None:
+    assets = {"tilejson": "url_tiles"}
+    roles = {"tilejson": ["tiles"]}
+    assert _select_assets(assets, ["tilejson"], None, "item-1", roles) == {
+        "tilejson": "url_tiles"
+    }
+
+
+@pytest.mark.unit
 def test_select_assets_filter_by_keys() -> None:
     assets = {"B04": "url1", "B03": "url2", "B02": "url3"}
     assert _select_assets(assets, ["B04", "B02"], None, "item-1") == {"B04": "url1", "B02": "url3"}
@@ -168,6 +187,43 @@ def test_download_items_asset_filter(sample_gdf, tmp_path: Path) -> None:
     paths = result.iloc[0]["local_paths"]
     assert "B04" in paths
     assert "B03" not in paths
+
+
+@pytest.mark.unit
+@respx.mock
+def test_download_items_signs_href_before_fetch(sample_gdf, tmp_path: Path) -> None:
+    signed = respx.get("https://example.com/B04.tif?token=abc").mock(
+        return_value=httpx.Response(200, content=b"\x00" * 10)
+    )
+
+    result = download_items(
+        sample_gdf.head(1),
+        output_dir=tmp_path,
+        assets=["B04"],
+        show_progress=False,
+        sign=lambda href: f"{href}?token=abc",
+    )
+
+    assert signed.called
+    assert result.iloc[0]["local_paths"]["B04"].suffix == ".tif"
+    # The GDF keeps the unsigned href.
+    assert result.iloc[0]["assets"]["B04"] == "https://example.com/B04.tif"
+
+
+@pytest.mark.unit
+def test_download_items_sign_failure_warns(sample_gdf, tmp_path: Path) -> None:
+    def broken_sign(href: str) -> str:
+        raise RuntimeError("no token")
+
+    with pytest.warns(UserWarning, match="Failed to sign"):
+        result = download_items(
+            sample_gdf.head(1),
+            output_dir=tmp_path,
+            assets=["B04"],
+            show_progress=False,
+            sign=broken_sign,
+        )
+    assert result.iloc[0]["local_paths"] == {}
 
 
 @pytest.mark.unit

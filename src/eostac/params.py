@@ -4,6 +4,9 @@ Each ``SearchParams`` subclass owns its own mapping to STAC properties via
 :meth:`SearchParams.to_query`, which returns a STAC *query extension* dict of the
 form ``{stac_property: {operator: value}}``.  ``None`` fields are omitted so the
 resulting query carries only the filters the caller actually set.
+
+Filters the query extension cannot express (e.g. "array contains") are returned
+by :meth:`SearchParams.to_filter` as CQL2-JSON predicates instead.
 """
 
 from __future__ import annotations
@@ -23,14 +26,16 @@ class SearchParams:
     """Base filter params, applicable to any sensor."""
 
     platform: str | None = None
-    product_type: str | None = None
 
     def to_query(self) -> dict[str, dict]:
         """Return a STAC query-extension dict for the non-``None`` fields."""
         query: dict[str, dict] = {}
         _add(query, "platform", "eq", self.platform)
-        _add(query, "product_type", "eq", self.product_type)
         return query
+
+    def to_filter(self) -> list[dict]:
+        """Return CQL2-JSON predicates for fields the query extension cannot express."""
+        return []
 
 
 @dataclass
@@ -71,15 +76,26 @@ class SARParams(SearchParams):
     """Filter params for SAR sensors (Sentinel-1, etc.)."""
 
     orbit_state: str | None = None  # sat:orbit_state: "ascending"/"descending"
-    polarizations: list[str] | None = None  # sar:polarizations, e.g. ["VV", "VH"]
+    # sar:polarizations — the item must carry at least all of these, e.g. ["VV", "VH"]
+    polarizations: list[str] | None = None
     instrument_mode: str | None = None  # sar:instrument_mode, e.g. "IW", "EW"
+    product_type: str | None = None  # sar:product_type, e.g. "GRD", "SLC"
 
     def to_query(self) -> dict[str, dict]:
         query = super().to_query()
         _add(query, "sat:orbit_state", "eq", self.orbit_state)
-        _add(query, "sar:polarizations", "in", self.polarizations)
         _add(query, "sar:instrument_mode", "eq", self.instrument_mode)
+        _add(query, "sar:product_type", "eq", self.product_type)
         return query
+
+    def to_filter(self) -> list[dict]:
+        predicates = super().to_filter()
+        if self.polarizations is not None:
+            prop = {"property": "sar:polarizations"}
+            predicates.append(
+                {"op": "a_contains", "args": [prop, list(self.polarizations)]}
+            )
+        return predicates
 
 
 @dataclass
