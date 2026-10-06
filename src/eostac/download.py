@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import json
 import random
+import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -451,7 +452,7 @@ async def _download_processed(
     overwrite: bool = False,
     sign: Callable[[str], str] | None = None,
 ) -> Path:
-    """Re-encode *href* as a COG GeoTIFF via rioxarray, in a worker thread."""
+    """Re-encode *href* as a COG GeoTIFF, in a worker thread."""
     cog_path = dest.with_suffix(".tif")
     if cog_path.exists() and not overwrite:
         return cog_path
@@ -466,15 +467,51 @@ async def _download_processed(
     return await _with_retries(href, attempt_once)
 
 
-def _write_cog(href: str, cog_path: Path) -> None:
-    import rioxarray  # noqa: F401
-    import xarray as xr
+# ---------------------------------------------------------------------------
+# COG writer — the one path for every raster the library writes itself
+# ---------------------------------------------------------------------------
 
-    ds = xr.open_dataset(href, engine="rasterio")
+_GDAL_HTTP_STATUS = re.compile(r"HTTP (?:error|response) code\s*:\s*(\d{3})")
+
+
+def _write_cog(href: str, cog_path: Path) -> None:
+    """Copy the raster at *href* to *cog_path* as a COG, with flat memory use.
+
+    GDAL streams the copy block by block, so the full array is never held in
+    memory.  Data type, nodata and georeferencing are those of the source.
+    """
+    import rasterio
+    from rasterio.errors import RasterioIOError
+    from rasterio.shutil import copy as rio_copy
+
+    tmp = cog_path.with_suffix(cog_path.suffix + ".part")
     try:
-        ds.rio.to_raster(str(cog_path), driver="COG", compress="DEFLATE")
+        with rasterio.open(href) as src:
+            rio_copy(src, tmp, driver="COG", compress="DEFLATE", bigtiff="IF_SAFER")
+        tmp.replace(cog_path)
+    except RasterioIOError as exc:
+        raise _classify_gdal_error(href, exc) from exc
+    except OSError:
+        raise  # local disk trouble, not a read failure
+    except Exception as exc:
+        raise _classify_gdal_error(href, exc) from exc
     finally:
-        ds.close()
+        tmp.unlink(missing_ok=True)
+
+
+def _classify_gdal_error(href: str, exc: Exception) -> Exception:
+    """Map a GDAL failure onto the retry policy used for raw transfers."""
+    message = str(exc)
+    match = _GDAL_HTTP_STATUS.search(message)
+    if match:
+        status = int(match.group(1))
+        kind = _Transient if _is_retryable_status(status) else _Permanent
+        return kind(f"HTTP {status}")
+    # No status to go on: a remote read may have hit a network glitch, a local
+    # one will fail the same way again.
+    if urlparse(href).scheme in ("http", "https"):
+        return _Transient(message)
+    return _Permanent(message)
 
 
 # ---------------------------------------------------------------------------
