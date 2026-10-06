@@ -152,3 +152,182 @@ def test_one_failed_asset_does_not_stop_the_others(
     paths = result.iloc[0]["local_paths"]
     assert "B04" not in paths
     assert paths["B03"].read_bytes() == b"b03"
+
+
+# ---------------------------------------------------------------------------
+# Resume
+# ---------------------------------------------------------------------------
+
+
+class _DroppedStream(httpx.AsyncByteStream):
+    """Yields *data*, then fails as a dropped connection would."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def __aiter__(self):
+        yield self._data
+        raise httpx.ReadError("connection dropped")
+
+
+def _dropped(data: bytes, etag: str | None = '"v1"') -> httpx.Response:
+    headers = {"ETag": etag} if etag else {}
+    return httpx.Response(200, headers=headers, stream=_DroppedStream(data))
+
+
+_RESUMED_WORLD = httpx.Response(
+    206,
+    headers={"ETag": '"v1"', "Content-Range": "bytes 6-10/11"},
+    content=b"world",
+)
+
+
+def _part_files(tmp_path: Path) -> list[Path]:
+    return [p for p in tmp_path.rglob("*.part") if p.is_file()]
+
+
+@pytest.mark.unit
+@respx.mock
+@patch("asyncio.sleep", new_callable=AsyncMock)
+def test_retry_resumes_from_bytes_already_received(
+    mock_sleep, sample_gdf, tmp_path: Path
+) -> None:
+    route = respx.get(_B04).mock(
+        side_effect=[
+            _dropped(b"hello "),
+            _RESUMED_WORLD,
+        ]
+    )
+
+    result = _download_b04(sample_gdf, tmp_path)
+
+    resumed = route.calls[1].request
+    assert resumed.headers["Range"] == "bytes=6-"
+    assert resumed.headers["If-Range"] == '"v1"'
+    assert _b04_path(result).read_bytes() == b"hello world"
+    assert _part_files(tmp_path) == []
+
+
+@pytest.mark.unit
+@respx.mock
+@patch("asyncio.sleep", new_callable=AsyncMock)
+def test_later_call_resumes_a_failed_transfer(
+    mock_sleep, sample_gdf, tmp_path: Path
+) -> None:
+    route = respx.get(_B04).mock(
+        side_effect=[
+            _dropped(b"hello "),
+            httpx.Response(503),
+            httpx.Response(503),
+            _RESUMED_WORLD,
+        ]
+    )
+
+    with pytest.warns(UserWarning, match="failed to download"):
+        failed = _download_b04(sample_gdf, tmp_path)
+    assert _b04_path(failed) is None
+    assert len(_part_files(tmp_path)) == 1
+
+    result = _download_b04(sample_gdf, tmp_path)
+
+    assert route.calls[3].request.headers["Range"] == "bytes=6-"
+    assert _b04_path(result).read_bytes() == b"hello world"
+
+
+@pytest.mark.unit
+@respx.mock
+@patch("asyncio.sleep", new_callable=AsyncMock)
+def test_changed_remote_file_restarts_from_zero(
+    mock_sleep, sample_gdf, tmp_path: Path
+) -> None:
+    # The server ignores If-Range for a stale ETag and sends the new file whole.
+    respx.get(_B04).mock(
+        side_effect=[
+            _dropped(b"old old "),
+            httpx.Response(200, headers={"ETag": '"v2"'}, content=b"new file"),
+        ]
+    )
+
+    result = _download_b04(sample_gdf, tmp_path)
+
+    assert _b04_path(result).read_bytes() == b"new file"
+
+
+@pytest.mark.unit
+@respx.mock
+@patch("asyncio.sleep", new_callable=AsyncMock)
+def test_no_etag_restarts_from_zero(mock_sleep, sample_gdf, tmp_path: Path) -> None:
+    route = respx.get(_B04).mock(
+        side_effect=[
+            _dropped(b"hello ", etag=None),
+            httpx.Response(200, content=b"hello world"),
+        ]
+    )
+
+    result = _download_b04(sample_gdf, tmp_path)
+
+    assert "Range" not in route.calls[1].request.headers
+    assert _b04_path(result).read_bytes() == b"hello world"
+
+
+@pytest.mark.unit
+@respx.mock
+@patch("asyncio.sleep", new_callable=AsyncMock)
+def test_server_without_range_support_restarts_from_zero(
+    mock_sleep, sample_gdf, tmp_path: Path
+) -> None:
+    # A Range request answered with 200 and the full body.
+    respx.get(_B04).mock(
+        side_effect=[
+            _dropped(b"hello "),
+            httpx.Response(200, headers={"ETag": '"v1"'}, content=b"hello world"),
+        ]
+    )
+
+    result = _download_b04(sample_gdf, tmp_path)
+
+    assert _b04_path(result).read_bytes() == b"hello world"
+
+
+@pytest.mark.unit
+@respx.mock
+@patch("asyncio.sleep", new_callable=AsyncMock)
+def test_overwrite_discards_partial_file(
+    mock_sleep, sample_gdf, tmp_path: Path
+) -> None:
+    route = respx.get(_B04).mock(
+        side_effect=[
+            _dropped(b"hello "),
+            httpx.Response(503),
+            httpx.Response(503),
+            httpx.Response(200, headers={"ETag": '"v1"'}, content=b"fresh"),
+        ]
+    )
+    with pytest.warns(UserWarning):
+        _download_b04(sample_gdf, tmp_path)
+
+    result = _download_b04(sample_gdf, tmp_path, overwrite=True)
+
+    assert "Range" not in route.calls[3].request.headers
+    assert _b04_path(result).read_bytes() == b"fresh"
+
+
+@pytest.mark.unit
+@respx.mock
+@patch("asyncio.sleep", new_callable=AsyncMock)
+def test_fully_received_partial_file_is_recovered(
+    mock_sleep, sample_gdf, tmp_path: Path
+) -> None:
+    # Every byte arrived but the transfer was not finalised: the server answers
+    # the Range request with 416, and the download starts over cleanly.
+    respx.get(_B04).mock(
+        side_effect=[
+            _dropped(b"complete"),
+            httpx.Response(416),
+            httpx.Response(200, headers={"ETag": '"v1"'}, content=b"complete"),
+        ]
+    )
+
+    result = _download_b04(sample_gdf, tmp_path)
+
+    assert _b04_path(result).read_bytes() == b"complete"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import random
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
@@ -340,24 +341,105 @@ async def _download_raw(
     overwrite: bool = False,
     sign: Callable[[str], str] | None = None,
 ) -> Path:
-    """Stream *href* to *dest*, signing it afresh on every attempt."""
+    """Stream *href* to *dest*, resuming any partial transfer.
+
+    Bytes go to ``<dest>.part``, which is kept on failure so that a retry, or a
+    later call, asks only for the missing bytes.  The href is signed afresh on
+    every attempt.
+    """
     if dest.exists() and not overwrite:
         return dest
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".part")
+    part = dest.with_suffix(dest.suffix + ".part")
+    state = part.with_suffix(part.suffix + ".json")
+    if overwrite:
+        _discard_partial(part, state)
 
     async def attempt_once() -> Path:
         url = await _signed(sign, href)
-        async with client.stream("GET", url, timeout=60) as resp:
+        offset, etag = _resume_point(part, state)
+        headers = {"Range": f"bytes={offset}-", "If-Range": etag} if offset else {}
+
+        async with client.stream("GET", url, headers=headers, timeout=60) as resp:
+            if offset and resp.status_code == 416:
+                # The partial file is not a prefix of the remote file any more.
+                _discard_partial(part, state)
+                raise _Transient("HTTP 416 on resume")
             _raise_for_status(resp)
-            with open(tmp, "wb") as fh:
-                async for chunk in resp.aiter_bytes(chunk_size=_CHUNK_SIZE):
-                    fh.write(chunk)
-        tmp.replace(dest)
+
+            resuming = resp.status_code == 206
+            if resuming and _content_range_start(resp) != offset:
+                _discard_partial(part, state)
+                raise _Transient("server resumed from an unexpected offset")
+
+            # A compressed body cannot be resumed: byte offsets would not match.
+            resumable = "Content-Encoding" not in resp.headers
+            try:
+                with open(part, "ab" if resuming else "wb", _CHUNK_SIZE) as fh:
+                    # Write bytes as they arrive (buffered by the file object)
+                    # so that a dropped connection loses nothing already received.
+                    async for chunk in resp.aiter_bytes():
+                        fh.write(chunk)
+            finally:
+                etag = resp.headers.get("ETag") if resumable else None
+                _save_resume_state(part, state, etag)
+
+        part.replace(dest)
+        state.unlink(missing_ok=True)
         return dest
 
     return await _with_retries(href, attempt_once)
+
+
+# ---------------------------------------------------------------------------
+# Resume bookkeeping
+# ---------------------------------------------------------------------------
+#
+# ``<dest>.part.json`` records the remote file's ETag and the byte ranges held
+# in ``<dest>.part`` as ``[[start, end], ...]`` (end exclusive).  Transfers are
+# sequential today, so there is a single range starting at 0.
+
+
+def _resume_point(part: Path, state: Path) -> tuple[int, str | None]:
+    """Return ``(offset, etag)`` to resume from, or ``(0, None)`` to start over."""
+    try:
+        meta = json.loads(state.read_text())
+        size = part.stat().st_size
+    except (OSError, ValueError):
+        return 0, None
+
+    etag = meta.get("etag")
+    ranges = meta.get("ranges") or []
+    # Resuming needs a strong ETag (If-Range ignores weak ones) and a partial
+    # file that is one contiguous prefix of the remote file.
+    if not etag or etag.startswith("W/") or len(ranges) != 1 or ranges[0][0] != 0:
+        return 0, None
+    # The partial file is append-only, so its size is the truth even if the
+    # state file was last written before the final chunks landed.
+    return size, etag
+
+
+def _save_resume_state(part: Path, state: Path, etag: str | None) -> None:
+    try:
+        size = part.stat().st_size
+        state.write_text(json.dumps({"etag": etag, "ranges": [[0, size]]}))
+    except OSError:
+        pass
+
+
+def _discard_partial(part: Path, state: Path) -> None:
+    part.unlink(missing_ok=True)
+    state.unlink(missing_ok=True)
+
+
+def _content_range_start(resp: httpx.Response) -> int | None:
+    """Return the first byte position of a ``Content-Range: bytes a-b/n`` header."""
+    value = resp.headers.get("Content-Range", "")
+    try:
+        return int(value.removeprefix("bytes").strip().split("-")[0])
+    except ValueError:
+        return None
 
 
 async def _download_processed(
