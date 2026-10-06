@@ -106,7 +106,7 @@ _Avoid_: sensor config, sensor filter
 - **Subset fidelity**: never resampled. Native CRS, resolution, data type and nodata are kept; the window is snapped outward to whole source pixels. Partial overlap gives the overlapping part; no overlap skips the asset with a warning. See ADR 0003.
 - **Non-raster assets with an area**: transferred whole. Only georeferenced rasters, identified by STAC media type, become Subsets.
 - **Written format**: everything the library writes itself (Subsets, `process=True`) is a COG from one shared writer. `bbox` with `process=True` is allowed and equivalent to `bbox` alone.
-- **Parallel connections per file, non-blocking writes**: deferred until a benchmark shows they matter. Reference workload: a few dozen full Sentinel-1 scenes (hundreds of MB to GB each) in one run.
+- **Parallel connections per file, non-blocking writes**: deferred until a benchmark shows they matter. Reference workload: the whole files of a few dozen Sentinel-1 Items (hundreds of MB to GB each) in one run.
 - **`process=True`**: kept, for normalising any raster format to COG, with flat memory use.
 - **`extra_query` precedence**: overrides `params` per property.
 - **Incompatible param warning**: when a filtered search returns zero Items, one unfiltered sample Item is fetched and `warnings.warn` names each filtered property that the sample does not carry (e.g. `max_cloud_cover` set but the Item has no `eo:cloud_cover`). No static collection registry.

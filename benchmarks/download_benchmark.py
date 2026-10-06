@@ -1,4 +1,4 @@
-"""Download benchmark: full Sentinel-1 scenes from Planetary Computer.
+"""Download benchmark: whole Sentinel-1 files from Planetary Computer.
 
 Measures what decides two open optimisations (see docs/specs/efficient-downloads.md):
 several connections per file, and non-blocking disk writes.
@@ -16,8 +16,8 @@ Sections (choose with ``--sections``):
 Every measurement starts from an empty directory, deleted afterwards, so
 Skip-existing and Resume never shorten a run.
 
-Data volume: a Sentinel-1 GRD ``vv`` file is about 0.66 GB.  With the default
-8 files, ``workers`` transfers ~16 GB, ``writes`` ~11 GB and ``ranges`` ~2 GB:
+Data volume: a Sentinel-1 GRD ``vv`` file is about 0.66 GB, so each pass over
+the default 8 files is roughly 5 GB.  In total, ``workers`` transfers ~16 GB, ``writes`` ~11 GB and ``ranges`` ~2 GB:
 about 29 GB in total.  Use ``--files 2`` for a quicker run (~9 GB), and
 ``--work-dir`` to pick the disk being measured.
 """
@@ -38,10 +38,11 @@ import planetary_computer
 from eostac import STACSource, download_items, search_items
 
 _API = "https://planetarycomputer.microsoft.com/api/stac/v1"
-# A fixed query, so that every run measures the same scenes.
+# A fixed, closed query: every matching Item is listed and the first ones by
+# id are kept, so every run measures the same files.
 _COLLECTION = "sentinel-1-grd"
 _BBOX = [0.0, 44.0, 6.0, 49.0]
-_DATETIME = "2024-06-01/2024-06-30"
+_DATETIME = "2024-06-01/2024-06-07"
 _CHUNK = 1 << 20
 
 
@@ -53,7 +54,6 @@ def find_hrefs(asset: str, count: int) -> tuple[object, list[str]]:
         collections=[_COLLECTION],
         bbox=_BBOX,
         datetime=_DATETIME,
-        limit=count * 4,
     )
     gdf = gdf[gdf["assets"].apply(lambda assets: asset in assets)]
     gdf = gdf.sort_values("item_id").head(count)
@@ -69,16 +69,18 @@ class Measurement:
         self._work_dir = work_dir
 
     def __enter__(self) -> "Measurement":
-        self.directory = Path(tempfile.mkdtemp(prefix="eostac-bench-", dir=self._work_dir))
+        self.directory = Path(
+            tempfile.mkdtemp(prefix="eostac-bench-", dir=self._work_dir)
+        )
         self._start = time.perf_counter()
         return self
 
     def __exit__(self, *exc_info) -> None:
         self.seconds = time.perf_counter() - self._start
         files = [p for p in self.directory.rglob("*") if p.is_file()]
-        self.megabytes = sum(
-            p.stat().st_size for p in files if p.suffix != ".gpkg"
-        ) / 1e6
+        self.megabytes = (
+            sum(p.stat().st_size for p in files if p.suffix != ".gpkg") / 1e6
+        )
         shutil.rmtree(self.directory, ignore_errors=True)
 
     def row(self, section: str, setting: str) -> tuple[str, str, str, str, str]:
@@ -118,7 +120,9 @@ def bench_workers(gdf, asset: str, work_dir: Path | None) -> list[tuple]:
 # ---------------------------------------------------------------------------
 
 
-async def _fetch(client: httpx.AsyncClient, url: str, path: Path, threaded: bool) -> None:
+async def _fetch(
+    client: httpx.AsyncClient, url: str, path: Path, threaded: bool
+) -> None:
     with open(path, "wb") as fh:
         async with client.stream("GET", url, timeout=60) as resp:
             resp.raise_for_status()
@@ -129,7 +133,9 @@ async def _fetch(client: httpx.AsyncClient, url: str, path: Path, threaded: bool
                     fh.write(chunk)
 
 
-async def _fetch_all(urls: list[str], directory: Path, threaded: bool, workers: int) -> None:
+async def _fetch_all(
+    urls: list[str], directory: Path, threaded: bool, workers: int
+) -> None:
     sem = asyncio.Semaphore(workers)
     async with httpx.AsyncClient(follow_redirects=True) as client:
 
@@ -205,14 +211,16 @@ def print_table(rows: list[tuple]) -> None:
     header = ("section", "setting", "MB", "seconds", "MB/s")
     widths = [max(len(str(r[i])) for r in [header, *rows]) for i in range(len(header))]
     for row in [header, tuple("-" * w for w in widths), *rows]:
-        cells = [str(c).ljust(w) if i < 2 else str(c).rjust(w)
-                 for i, (c, w) in enumerate(zip(row, widths))]
+        cells = [
+            str(c).ljust(w) if i < 2 else str(c).rjust(w)
+            for i, (c, w) in enumerate(zip(row, widths))
+        ]
         print("  ".join(cells))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--files", type=int, default=8, help="number of scenes")
+    parser.add_argument("--files", type=int, default=8, help="number of Items")
     parser.add_argument("--asset", default="vv", help="asset key to download")
     parser.add_argument(
         "--sections",
@@ -221,11 +229,15 @@ def main() -> None:
         default=("workers", "writes", "ranges"),
     )
     parser.add_argument(
-        "--write-workers", type=int, default=8,
+        "--write-workers",
+        type=int,
+        default=8,
         help="files downloaded at once in the writes section",
     )
     parser.add_argument(
-        "--work-dir", type=Path, default=None,
+        "--work-dir",
+        type=Path,
+        default=None,
         help="directory to download into (default: the system temp directory)",
     )
     args = parser.parse_args()

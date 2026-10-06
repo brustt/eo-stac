@@ -8,6 +8,7 @@ import json
 import math
 import random
 import re
+import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,7 +37,7 @@ _RASTER_MEDIA_TYPES = ("image/tiff", "image/jp2")
 
 # HTTP statuses worth retrying, besides every 5xx.
 _RETRYABLE_STATUSES = frozenset({408, 429})
-# Upper bound on how long a server's Retry-After can make one download wait.
+# Longest Retry-After worth waiting for; beyond it the asset is given up on.
 _MAX_RETRY_AFTER = 300.0
 
 # Roles marking an asset as a service endpoint rather than a downloadable file.
@@ -74,8 +75,10 @@ def download_items(
     overwrite:
         Re-download files that already exist locally.
     process:
-        When ``True``, re-encode each file via *rioxarray* as a COG GeoTIFF
-        (``compress=DEFLATE``).  Slower but normalises the output format.
+        When ``True``, re-encode each file as a COG GeoTIFF
+        (``compress=DEFLATE``) through a streamed GDAL copy, with flat memory
+        use.  Slower but normalises the output format.  Ignored when an area
+        is given: Subsets are always COGs and other assets are copied as-is.
     show_progress:
         Display a ``tqdm`` progress bar.
     extra_aliases:
@@ -135,6 +138,13 @@ async def _download_items_async(
     gdf = gdf.copy()
     gdf["local_paths"] = [{} for _ in gdf.index]
 
+    if area is not None and "asset_types" not in gdf.columns:
+        warnings.warn(
+            "The GeoDataFrame has no asset_types column, so rasters cannot be "
+            "told apart: whole files will be transferred instead of Subsets.",
+            stacklevel=2,
+        )
+
     tasks: list[_Task] = []
     for idx, row in gdf.iterrows():
         item_assets: dict[str, str] = row.get("assets") or {}
@@ -158,22 +168,28 @@ async def _download_items_async(
         for key, href in selected.items():
             if area is not None and _is_raster(type_by_href.get(href)):
                 dest = pm.subset_path(collection, item_id, item_dt, key, area)
-                tasks.append(_Task(idx, key, href, dest, area))
+                tasks.append(_Task(idx, key, href, dest, area, as_cog=True))
             else:
                 suffix = _href_suffix(href)
                 dest = pm.asset_path(collection, item_id, item_dt, key, suffix=suffix)
-                tasks.append(_Task(idx, key, href, dest))
+                # With an area, whatever is not a Subset is copied as-is.
+                as_cog = process and area is None
+                tasks.append(_Task(idx, key, href, dest, as_cog=as_cog))
 
-    results, errors = await _run_downloads(
-        tasks, process, max_workers, overwrite, show_progress, sign
+    results, errors, skipped = await _run_downloads(
+        tasks, max_workers, overwrite, show_progress, sign
     )
 
     for (row_idx, key), local_path in results.items():
         gdf.at[row_idx, "local_paths"][key] = local_path
 
-    if errors:
-        import warnings
+    if skipped:
+        warnings.warn(
+            f"{len(skipped)} asset(s) skipped:\n" + "\n".join(skipped),
+            stacklevel=2,
+        )
 
+    if errors:
         warnings.warn(
             f"{len(errors)} asset(s) failed to download:\n" + "\n".join(errors),
             stacklevel=2,
@@ -199,6 +215,7 @@ class _Task:
     href: str
     dest: Path
     area: tuple[float, ...] | None = None
+    as_cog: bool = False
 
 
 def _area_bounds(
@@ -209,6 +226,10 @@ def _area_bounds(
         geom = shape(polygon) if isinstance(polygon, dict) else polygon
         return tuple(float(v) for v in geom.bounds)
     if bbox is not None:
+        if len(bbox) != 4:
+            raise ValueError(
+                f"bbox must be [west, south, east, north], got {list(bbox)!r}"
+            )
         return tuple(float(v) for v in bbox)
     return None
 
@@ -268,21 +289,22 @@ def _select_assets(
 
 async def _run_downloads(
     tasks: list[_Task],
-    process: bool,
     max_workers: int,
     overwrite: bool,
     show_progress: bool,
     sign: Callable[[str], str] | None = None,
-) -> tuple[dict[tuple[int, str], Path], list[str]]:
+) -> tuple[dict[tuple[int, str], Path], list[str], list[str]]:
+    """Run *tasks*; return ``(results, errors, skipped)``."""
     results: dict[tuple[int, str], Path] = {}
     errors: list[str] = []
+    skipped: list[str] = []
     sem = asyncio.Semaphore(max_workers)
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
 
         async def run_one(task: _Task) -> tuple:
             async with sem:
-                if task.area is not None or process:
+                if task.as_cog:
                     path = await _download_as_cog(
                         task.href, task.dest, overwrite, sign, task.area
                     )
@@ -305,10 +327,12 @@ async def _run_downloads(
             try:
                 row_idx, key, local_path = await coro
                 results[(row_idx, key)] = local_path
+            except _SkippedAsset as exc:
+                skipped.append(str(exc))
             except DownloadError as exc:
                 errors.append(str(exc))
 
-    return results, errors
+    return results, errors, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +353,15 @@ class _Permanent(Exception):
 
 
 class _NoSubset(Exception):
-    """The raster has no Subset over the requested area."""
+    """The raster cannot have a Subset (it has no pixel grid)."""
+
+
+class _NoOverlap(Exception):
+    """The requested area lies outside the raster."""
+
+
+class _SkippedAsset(DownloadError):
+    """Nothing to write for this asset; reported as skipped, not failed."""
 
 
 def _is_retryable_status(status: int) -> bool:
@@ -365,7 +397,7 @@ def _backoff(attempt: int, retry_after: float | None) -> float:
     """Exponential delay with jitter, never shorter than the server's request."""
     delay = 2 ** (attempt - 1) + random.random()
     if retry_after is not None:
-        delay = max(delay, min(retry_after, _MAX_RETRY_AFTER))
+        delay = max(delay, retry_after)
     return delay
 
 
@@ -378,6 +410,13 @@ async def _signed(sign: Callable[[str], str] | None, href: str) -> str:
         raise DownloadError(f"Failed to sign {href}: {exc}") from exc
 
 
+def _failure(href: str, exc: Exception, attempt: int, note: str = "") -> DownloadError:
+    """Build the error reported for *href*, saying whether it was retried."""
+    reason = str(exc) or type(exc).__name__
+    retried = "not retried" if attempt == 1 else f"after {attempt} attempts"
+    return DownloadError(f"Failed to download {href}: {reason} ({retried}{note})")
+
+
 async def _with_retries(href: str, attempt_once: Callable[[], Awaitable[Path]]) -> Path:
     """Run *attempt_once* until it succeeds, retrying transient failures only."""
     for attempt in range(1, _RETRY_COUNT + 1):
@@ -386,22 +425,19 @@ async def _with_retries(href: str, attempt_once: Callable[[], Awaitable[Path]]) 
         except DownloadError:
             raise
         except (httpx.UnsupportedProtocol, httpx.InvalidURL) as exc:
-            raise DownloadError(
-                f"Failed to download {href}: {exc} (not retried)"
-            ) from exc
+            raise _failure(href, exc, attempt) from exc
         except (_Transient, httpx.TransportError) as exc:
-            reason = str(exc) or type(exc).__name__
             if attempt == _RETRY_COUNT:
-                raise DownloadError(
-                    f"Failed to download {href}: {reason} "
-                    f"(after {_RETRY_COUNT} attempts)"
-                ) from exc
-            await asyncio.sleep(_backoff(attempt, getattr(exc, "retry_after", None)))
+                raise _failure(href, exc, attempt) from exc
+            retry_after = exc.retry_after if isinstance(exc, _Transient) else None
+            if retry_after is not None and retry_after > _MAX_RETRY_AFTER:
+                # Retrying sooner than asked would be impolite, waiting that
+                # long would stall the run: give up on this asset instead.
+                note = f"; server asked to wait {retry_after:.0f} s"
+                raise _failure(href, exc, attempt, note) from exc
+            await asyncio.sleep(_backoff(attempt, retry_after))
         except Exception as exc:
-            reason = str(exc) or type(exc).__name__
-            raise DownloadError(
-                f"Failed to download {href}: {reason} (not retried)"
-            ) from exc
+            raise _failure(href, exc, attempt) from exc
 
     raise DownloadError(f"Exhausted retries for {href}")  # pragma: no cover
 
@@ -544,6 +580,8 @@ async def _download_as_cog(
             await asyncio.to_thread(_write_cog, url, cog_path, area)
         except _NoSubset as exc:
             raise DownloadError(f"No Subset for {href}: {exc}") from exc
+        except _NoOverlap as exc:
+            raise _SkippedAsset(f"{href}: {exc}") from exc
         return cog_path
 
     return await _with_retries(href, attempt_once)
@@ -579,8 +617,9 @@ def _write_cog(
                 with _subset_view(src, area) as view:
                     rio_copy(view, tmp, **options)
         tmp.replace(cog_path)
-    except _NoSubset:
+    except (_NoSubset, _NoOverlap):
         raise
+    # RasterioIOError is an OSError: classify it before letting real OSErrors by.
     except RasterioIOError as exc:
         raise _classify_gdal_error(href, exc) from exc
     except OSError:
@@ -616,7 +655,7 @@ def _subset_window(src, area: tuple[float, ...]):
     col_off, row_off = max(col_off, 0), max(row_off, 0)
     col_end, row_end = min(col_end, src.width), min(row_end, src.height)
     if col_end <= col_off or row_end <= row_off:
-        raise _NoSubset("the requested area does not overlap the raster")
+        raise _NoOverlap("the requested area does not overlap the raster")
     return Window(col_off, row_off, col_end - col_off, row_end - row_off)
 
 
@@ -677,7 +716,6 @@ def _save_metadata(
             serialisable["subset_bbox"] = ",".join(repr(v) for v in area)
         serialisable.to_file(str(path), driver="GPKG")
     except Exception as exc:
-        import warnings
         warnings.warn(f"Failed to save metadata to {path}: {exc}", stacklevel=2)
 
 

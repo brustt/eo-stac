@@ -368,8 +368,15 @@ def test_ungridded_raster_has_no_subset(tmp_path: Path) -> None:
         GroundControlPoint(row=_SIZE, col=_SIZE, x=3.01, y=48.74),
     ]
     with rasterio.open(
-        ungridded, "w", driver="GTiff", width=_SIZE, height=_SIZE, count=1,
-        dtype="uint16", gcps=gcps, crs="EPSG:4326",
+        ungridded,
+        "w",
+        driver="GTiff",
+        width=_SIZE,
+        height=_SIZE,
+        count=1,
+        dtype="uint16",
+        gcps=gcps,
+        crs="EPSG:4326",
     ) as dst:
         dst.write(np.ones((1, _SIZE, _SIZE), dtype="uint16"))
     gridded = tmp_path / "source.tif"
@@ -445,9 +452,7 @@ def test_area_with_process_behaves_like_area_alone(raster_gdf, tmp_path: Path) -
     area = lonlat(_INNER_UTM)
 
     alone = _download(raster_gdf, tmp_path / "a", assets=["vv"], bbox=area)
-    both = _download(
-        raster_gdf, tmp_path / "b", assets=["vv"], bbox=area, process=True
-    )
+    both = _download(raster_gdf, tmp_path / "b", assets=["vv"], bbox=area, process=True)
 
     alone_path = alone.iloc[0]["local_paths"]["vv"]
     both_path = both.iloc[0]["local_paths"]["vv"]
@@ -455,3 +460,60 @@ def test_area_with_process_behaves_like_area_alone(raster_gdf, tmp_path: Path) -
     with rasterio.open(alone_path) as a, rasterio.open(both_path) as b:
         assert a.bounds == b.bounds
         np.testing.assert_array_equal(a.read(), b.read())
+
+
+@pytest.mark.unit
+@respx.mock
+def test_area_with_process_still_transfers_non_rasters_whole(tmp_path: Path) -> None:
+    source = tmp_path / "source.tif"
+    write_raster(source)
+    respx.get("https://example.com/manifest.xml").mock(
+        return_value=httpx.Response(200, content=b"<xml/>")
+    )
+    gdf = gdf_with_assets(
+        {
+            "vv": (str(source), _GEOTIFF),
+            "manifest": ("https://example.com/manifest.xml", "application/xml"),
+        }
+    )
+
+    result = _download(gdf, tmp_path, bbox=lonlat(_INNER_UTM), process=True)
+
+    paths = result.iloc[0]["local_paths"]
+    assert paths["vv"].name.startswith("item-001_vv_sub-")
+    assert paths["manifest"].read_bytes() == b"<xml/>"
+
+
+@pytest.mark.unit
+def test_no_overlap_is_reported_as_skipped_not_failed(
+    raster_gdf, tmp_path: Path
+) -> None:
+    far_away = lonlat((520000.0, 5399400.0, 520500.0, 5399800.0))
+
+    with pytest.warns(UserWarning) as caught:
+        _download(raster_gdf, tmp_path, assets=["vv"], bbox=far_away)
+
+    messages = [str(w.message) for w in caught]
+    assert any("skipped" in m and "does not overlap" in m for m in messages)
+    assert not any("failed to download" in m for m in messages)
+
+
+@pytest.mark.unit
+def test_area_without_media_types_warns(raster_gdf, tmp_path: Path) -> None:
+    gdf = raster_gdf.drop(columns=["asset_types"])
+    gdf["assets"] = [{"vv": "https://example.com/vv.tif"}]
+
+    with respx.mock:
+        respx.get("https://example.com/vv.tif").mock(
+            return_value=httpx.Response(200, content=b"whole")
+        )
+        with pytest.warns(UserWarning, match="asset_types.*whole"):
+            result = _download(gdf, tmp_path, assets=["vv"], bbox=lonlat(_INNER_UTM))
+
+    assert result.iloc[0]["local_paths"]["vv"].read_bytes() == b"whole"
+
+
+@pytest.mark.unit
+def test_bbox_must_have_four_values(raster_gdf, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="west, south, east, north"):
+        _download(raster_gdf, tmp_path, assets=["vv"], bbox=[2.0, 48.0, 3.0])

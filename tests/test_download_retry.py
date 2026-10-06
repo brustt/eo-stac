@@ -355,3 +355,35 @@ def test_server_ignoring_if_range_does_not_splice_a_changed_file(
     result = _download_b04(sample_gdf, tmp_path)
 
     assert _b04_path(result).read_bytes() == b"new file!!!"
+
+
+@pytest.mark.unit
+@respx.mock
+@patch("asyncio.sleep", new_callable=AsyncMock)
+def test_failure_after_a_retry_does_not_claim_it_was_not_retried(
+    mock_sleep, sample_gdf, tmp_path: Path
+) -> None:
+    respx.get(_B04).mock(side_effect=[httpx.Response(503), httpx.Response(404)])
+
+    with pytest.warns(UserWarning, match=r"HTTP 404.*after 2 attempts") as caught:
+        _download_b04(sample_gdf, tmp_path)
+
+    assert "not retried" not in str(caught[0].message)
+
+
+@pytest.mark.unit
+@respx.mock
+@patch("asyncio.sleep", new_callable=AsyncMock)
+def test_never_retries_sooner_than_the_server_asked(
+    mock_sleep, sample_gdf, tmp_path: Path
+) -> None:
+    # An unreasonably long Retry-After fails the asset rather than being cut short.
+    route = respx.get(_B04).mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "900"})
+    )
+
+    with pytest.warns(UserWarning, match=r"HTTP 429.*wait 900 s"):
+        _download_b04(sample_gdf, tmp_path)
+
+    assert route.call_count == 1
+    mock_sleep.assert_not_called()
