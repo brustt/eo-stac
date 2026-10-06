@@ -17,6 +17,8 @@ from urllib.parse import urlparse
 
 import geopandas as gpd
 import httpx
+from shapely.geometry import shape
+from shapely.geometry.base import BaseGeometry
 from tqdm import tqdm
 
 from eostac.aliases import resolve
@@ -52,6 +54,7 @@ def download_items(
     extra_aliases: dict[str, list[str]] | None = None,
     sign: Callable[[str], str] | None = None,
     bbox: Sequence[float] | None = None,
+    polygon: dict | BaseGeometry | None = None,
 ) -> gpd.GeoDataFrame:
     """Download assets for every item in *gdf*.
 
@@ -87,7 +90,16 @@ def download_items(
         given, each raster asset is written as a Subset — the part covering
         the area, as a COG — instead of the provider's whole file.  A Subset
         keeps the source pixels, CRS and resolution: it is never resampled,
-        and may extend slightly beyond the area.
+        and may extend slightly beyond the area.  Rasters without a pixel
+        grid (georeferenced by ground control points only, e.g. Sentinel-1
+        GRD) have no Subset and are reported as failed; other assets
+        (thumbnails, metadata files) are transferred whole.  The area is
+        recorded in the metadata GeoPackage as ``subset_bbox``.
+    polygon:
+        Area of interest as a GeoJSON geometry dict or a Shapely geometry in
+        EPSG:4326, as an alternative to *bbox*.  It is reduced to its bounding
+        box — pixels outside the polygon are not masked — and takes precedence
+        over *bbox*.
 
     Returns
     -------
@@ -97,7 +109,7 @@ def download_items(
     """
     coro = _download_items_async(
         gdf, output_dir, assets, max_workers, overwrite, process, show_progress,
-        extra_aliases, sign, bbox,
+        extra_aliases, sign, _area_bounds(bbox, polygon),
     )
     try:
         asyncio.get_running_loop()
@@ -117,10 +129,9 @@ async def _download_items_async(
     show_progress: bool = True,
     extra_aliases: dict[str, list[str]] | None = None,
     sign: Callable[[str], str] | None = None,
-    bbox: Sequence[float] | None = None,
+    area: tuple[float, ...] | None = None,
 ) -> gpd.GeoDataFrame:
     pm = PathManager(output_dir)
-    area = tuple(float(v) for v in bbox) if bbox is not None else None
     gdf = gdf.copy()
     gdf["local_paths"] = [{} for _ in gdf.index]
 
@@ -169,7 +180,7 @@ async def _download_items_async(
         )
 
     meta_name = f"search_results_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H%M%S')}"
-    _save_metadata(gdf, pm.metadata_path(meta_name))
+    _save_metadata(gdf, pm.metadata_path(meta_name), area)
 
     return gdf
 
@@ -188,6 +199,18 @@ class _Task:
     href: str
     dest: Path
     area: tuple[float, ...] | None = None
+
+
+def _area_bounds(
+    bbox: Sequence[float] | None, polygon: dict | BaseGeometry | None
+) -> tuple[float, ...] | None:
+    """Return the area of interest as EPSG:4326 bounds; *polygon* wins."""
+    if polygon is not None:
+        geom = shape(polygon) if isinstance(polygon, dict) else polygon
+        return tuple(float(v) for v in geom.bounds)
+    if bbox is not None:
+        return tuple(float(v) for v in bbox)
+    return None
 
 
 def _is_raster(media_type: str | None) -> bool:
@@ -303,6 +326,10 @@ class _Transient(Exception):
 
 class _Permanent(Exception):
     """A failure that a retry cannot fix (missing file, refused access)."""
+
+
+class _NoSubset(Exception):
+    """The raster has no Subset over the requested area."""
 
 
 def _is_retryable_status(status: int) -> bool:
@@ -508,7 +535,10 @@ async def _download_as_cog(
 
     async def attempt_once() -> Path:
         url = await _signed(sign, href)
-        await asyncio.to_thread(_write_cog, url, cog_path, area)
+        try:
+            await asyncio.to_thread(_write_cog, url, cog_path, area)
+        except _NoSubset as exc:
+            raise DownloadError(f"No Subset for {href}: {exc}") from exc
         return cog_path
 
     return await _with_retries(href, attempt_once)
@@ -544,6 +574,8 @@ def _write_cog(
                 with _subset_view(src, area) as view:
                     rio_copy(view, tmp, **options)
         tmp.replace(cog_path)
+    except _NoSubset:
+        raise
     except RasterioIOError as exc:
         raise _classify_gdal_error(href, exc) from exc
     except OSError:
@@ -555,9 +587,19 @@ def _write_cog(
 
 
 def _subset_window(src, area: tuple[float, ...]):
-    """Return the pixel window of *src* covering *area*, snapped outward."""
+    """Return the pixel window of *src* covering *area*, snapped outward.
+
+    The window is limited to the raster's extent.
+    """
     from rasterio.warp import transform_bounds
     from rasterio.windows import Window, from_bounds
+
+    if src.crs is None:
+        raise _NoSubset(
+            "the raster has no pixel grid (it is georeferenced by ground "
+            "control points only); download the whole file or use a gridded "
+            "collection"
+        )
 
     bounds = transform_bounds("EPSG:4326", src.crs, *area, densify_pts=21)
     exact = from_bounds(*bounds, transform=src.transform)
@@ -566,6 +608,10 @@ def _subset_window(src, area: tuple[float, ...]):
     row_off = math.floor(round(exact.row_off, 6))
     col_end = math.ceil(round(exact.col_off + exact.width, 6))
     row_end = math.ceil(round(exact.row_off + exact.height, 6))
+    col_off, row_off = max(col_off, 0), max(row_off, 0)
+    col_end, row_end = min(col_end, src.width), min(row_end, src.height)
+    if col_end <= col_off or row_end <= row_off:
+        raise _NoSubset("the requested area does not overlap the raster")
     return Window(col_off, row_off, col_end - col_off, row_end - row_off)
 
 
@@ -593,7 +639,8 @@ def _subset_view(src, area: tuple[float, ...]):
 
 def _classify_gdal_error(href: str, exc: Exception) -> Exception:
     """Map a GDAL failure onto the retry policy used for raw transfers."""
-    message = str(exc)
+    # *href* may be signed: keep its token out of error messages.
+    message = str(exc).replace(href, "the asset")
     match = _GDAL_HTTP_STATUS.search(message)
     if match:
         status = int(match.group(1))
@@ -611,7 +658,9 @@ def _classify_gdal_error(href: str, exc: Exception) -> Exception:
 # ---------------------------------------------------------------------------
 
 
-def _save_metadata(gdf: gpd.GeoDataFrame, path: Path) -> None:
+def _save_metadata(
+    gdf: gpd.GeoDataFrame, path: Path, area: tuple[float, ...] | None = None
+) -> None:
     try:
         serialisable = gdf.drop(
             columns=[
@@ -619,6 +668,8 @@ def _save_metadata(gdf: gpd.GeoDataFrame, path: Path) -> None:
             ],
             errors="ignore",
         )
+        if area is not None:
+            serialisable["subset_bbox"] = ",".join(repr(v) for v in area)
         serialisable.to_file(str(path), driver="GPKG")
     except Exception as exc:
         import warnings

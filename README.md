@@ -105,7 +105,7 @@ Property names differ between providers. `extra_query` is a raw STAC query-exten
 
 ### `download_items()`
 
-Downloads run concurrently via `asyncio` and `httpx`. All assets start immediately; `max_workers` caps concurrent connections via a semaphore. When `process=True`, rioxarray/GDAL encoding runs in a worker thread so the event loop stays unblocked.
+Downloads run concurrently via `asyncio` and `httpx`. All assets start immediately; `max_workers` caps concurrent connections via a semaphore. When `process=True`, GDAL encoding runs in a worker thread so the event loop stays unblocked.
 
 ```python
 gdf = download_items(
@@ -113,13 +113,33 @@ gdf = download_items(
     output_dir="downloads/",
     assets=["B04", "B03"],  # band aliases ("red") or asset keys; None → all downloadable assets
     max_workers=4,          # max concurrent downloads (async semaphore)
-    overwrite=False,        # skip existing files by default
-    process=False,          # True → re-encode as COG GeoTIFF via rioxarray
+    overwrite=False,        # finished files are skipped by default
+    process=False,          # True → re-encode as COG GeoTIFF (streamed, flat memory)
     show_progress=True,
     sign=None,              # href → href callable for providers needing signed URLs
+    bbox=None,              # [west, south, east, north] → write Subsets, see below
+    polygon=None,           # alternative to bbox (GeoJSON dict or Shapely)
 )
 # gdf now has a 'local_paths' column: dict of asset_key → Path
 ```
+
+**Skip-existing and Resume.** A finished file is never fetched again unless `overwrite=True`. An interrupted transfer is resumed: bytes go to `<file>.part`, which is kept on failure, and a retry or a later call asks the server only for the missing bytes. Resume is guarded by the remote file's ETag, so a file that changed on the server restarts from zero; so does a transfer from a server without range or ETag support. `overwrite=True` discards partial files too.
+
+**Retries.** Connection errors, timeouts and HTTP 408, 429 and 5xx are retried up to three times with backoff, honouring `Retry-After`. Any other 4xx (for example 403 from an unsigned href, or 404) fails at once. A failed asset is reported in a warning and left out of `local_paths`; the other downloads continue.
+
+**Subsets.** With `bbox` or `polygon` (EPSG:4326), each raster asset is written as a Subset: the part covering the area, as a COG, instead of the provider's whole file.
+
+```python
+gdf = download_items(gdf, "downloads/", assets=["vv"], bbox=[2.2, 48.8, 2.5, 48.9])
+# → downloads/<collection>/<date>/<item_id>/<item_id>_vv_sub-1a2b3c4d.tif
+```
+
+- A Subset is never resampled. It keeps the source pixels, CRS, resolution, data type and nodata, so it is slightly larger than the area and is not in EPSG:4326.
+- A polygon is reduced to its bounding box; pixels outside it are not masked.
+- The file name carries a tag derived from the area, so Subsets of different areas and the whole file coexist. The area is recorded as `subset_bbox` in the metadata GeoPackage.
+- An area that only partly overlaps a raster gives the overlapping part. No overlap skips that asset with a warning.
+- Rasters georeferenced only by ground control points, such as Sentinel-1 GRD, have no Subset and are reported as failed. Download the whole file, or use a gridded collection such as `sentinel-1-rtc`.
+- Non-raster assets (thumbnails, XML, manifests) are transferred whole.
 
 Downloaded files are organized as:
 ```

@@ -279,3 +279,177 @@ def test_subset_resolves_band_alias(tmp_path: Path) -> None:
     result = _download(gdf, tmp_path, assets=["red"], bbox=lonlat(_INNER_UTM))
 
     assert result.iloc[0]["local_paths"]["red"].name.startswith("item-001_red_sub-")
+
+
+# ---------------------------------------------------------------------------
+# Subset edge cases and mixed assets
+# ---------------------------------------------------------------------------
+
+
+def _subset_bounds(result, key: str = "vv") -> tuple:
+    with rasterio.open(result.iloc[0]["local_paths"][key]) as out:
+        return tuple(out.bounds)
+
+
+@pytest.fixture
+def raster_gdf(tmp_path: Path) -> gpd.GeoDataFrame:
+    source = tmp_path / "source.tif"
+    write_raster(source)
+    return gdf_with_assets({"vv": (str(source), _GEOTIFF)})
+
+
+@pytest.mark.unit
+def test_polygon_is_reduced_to_its_bounding_box(raster_gdf, tmp_path: Path) -> None:
+    from shapely.geometry import Polygon
+
+    west, south, east, north = lonlat(_INNER_UTM)
+    triangle = Polygon([(west, south), (east, south), (west, north)])
+
+    from_polygon = _download(raster_gdf, tmp_path / "a", assets=["vv"], polygon=triangle)
+    from_bbox = _download(
+        raster_gdf, tmp_path / "b", assets=["vv"], bbox=list(triangle.bounds)
+    )
+
+    assert _subset_bounds(from_polygon) == _subset_bounds(from_bbox)
+    with rasterio.open(from_polygon.iloc[0]["local_paths"]["vv"]) as out:
+        # Nothing is masked: the corner outside the triangle keeps its pixels.
+        assert (out.read() != out.nodata).all()
+
+
+@pytest.mark.unit
+def test_polygon_accepts_geojson_and_wins_over_bbox(raster_gdf, tmp_path: Path) -> None:
+    geojson = mapping(box(*lonlat(_INNER_UTM)))
+    elsewhere = lonlat((500400.0, 5399400.0, 500600.0, 5399600.0))
+
+    result = _download(
+        raster_gdf, tmp_path / "a", assets=["vv"], polygon=geojson, bbox=elsewhere
+    )
+    expected = _download(
+        raster_gdf, tmp_path / "b", assets=["vv"], bbox=lonlat(_INNER_UTM)
+    )
+
+    assert _subset_bounds(result) == _subset_bounds(expected)
+
+
+@pytest.mark.unit
+def test_partial_overlap_gives_the_overlapping_part(raster_gdf, tmp_path: Path) -> None:
+    # Extends 300 m beyond the raster's east and north edges.
+    area = lonlat((500400.0, 5399800.0, 500940.0, 5400300.0))
+
+    result = _download(raster_gdf, tmp_path, assets=["vv"], bbox=area)
+
+    left, bottom, right, top = _subset_bounds(result)
+    assert (right, top) == (_ORIGIN[0] + _SIZE * _RES, _ORIGIN[1])
+    assert left <= 500400.0 and bottom <= 5399800.0
+
+
+@pytest.mark.unit
+def test_no_overlap_skips_the_asset_with_a_warning(raster_gdf, tmp_path: Path) -> None:
+    far_away = lonlat((520000.0, 5399400.0, 520500.0, 5399800.0))
+
+    with pytest.warns(UserWarning, match="does not overlap"):
+        result = _download(raster_gdf, tmp_path, assets=["vv"], bbox=far_away)
+
+    assert result.iloc[0]["local_paths"] == {}
+    assert not list((tmp_path / "out").rglob("*.tif"))
+
+
+@pytest.mark.unit
+def test_ungridded_raster_has_no_subset(tmp_path: Path) -> None:
+    from rasterio.control import GroundControlPoint
+
+    ungridded = tmp_path / "grd.tif"
+    gcps = [
+        GroundControlPoint(row=0, col=0, x=3.0, y=48.75),
+        GroundControlPoint(row=0, col=_SIZE, x=3.01, y=48.75),
+        GroundControlPoint(row=_SIZE, col=0, x=3.0, y=48.74),
+        GroundControlPoint(row=_SIZE, col=_SIZE, x=3.01, y=48.74),
+    ]
+    with rasterio.open(
+        ungridded, "w", driver="GTiff", width=_SIZE, height=_SIZE, count=1,
+        dtype="uint16", gcps=gcps, crs="EPSG:4326",
+    ) as dst:
+        dst.write(np.ones((1, _SIZE, _SIZE), dtype="uint16"))
+    gridded = tmp_path / "source.tif"
+    write_raster(gridded)
+    gdf = gdf_with_assets(
+        {"vv": (str(ungridded), _GEOTIFF), "vh": (str(gridded), _GEOTIFF)}
+    )
+
+    with pytest.warns(UserWarning, match="no pixel grid.*whole file"):
+        result = _download(
+            gdf, tmp_path, assets=["vv", "vh"], bbox=[3.002, 48.742, 3.008, 48.748]
+        )
+
+    paths = result.iloc[0]["local_paths"]
+    assert "vv" not in paths
+    assert "vh" in paths  # the gridded asset in the same call is still written
+
+
+@pytest.mark.unit
+@respx.mock
+def test_non_raster_assets_are_transferred_whole(tmp_path: Path) -> None:
+    source = tmp_path / "source.tif"
+    write_raster(source)
+    respx.get("https://example.com/thumb.png").mock(
+        return_value=httpx.Response(200, content=b"png-bytes")
+    )
+    respx.get("https://example.com/manifest.xml").mock(
+        return_value=httpx.Response(200, content=b"<xml/>")
+    )
+    gdf = gdf_with_assets(
+        {
+            "vv": (str(source), _GEOTIFF),
+            "thumbnail": ("https://example.com/thumb.png", "image/png"),
+            "manifest": ("https://example.com/manifest.xml", None),
+        }
+    )
+
+    result = _download(gdf, tmp_path, bbox=lonlat(_INNER_UTM))  # assets=None
+
+    paths = result.iloc[0]["local_paths"]
+    assert paths["vv"].name.startswith("item-001_vv_sub-")
+    assert paths["thumbnail"].read_bytes() == b"png-bytes"
+    assert paths["thumbnail"].name == "item-001_thumbnail.png"
+    assert paths["manifest"].read_bytes() == b"<xml/>"
+
+
+@pytest.mark.unit
+def test_area_is_recorded_in_metadata(raster_gdf, tmp_path: Path) -> None:
+    area = lonlat(_INNER_UTM)
+
+    _download(raster_gdf, tmp_path, assets=["vv"], bbox=area)
+
+    (meta,) = (tmp_path / "out" / "metadata").glob("*.gpkg")
+    saved = gpd.read_file(meta)
+    recorded = [float(v) for v in saved.iloc[0]["subset_bbox"].split(",")]
+    assert recorded == pytest.approx(area)
+
+
+@pytest.mark.unit
+def test_no_area_records_no_subset_bbox(tmp_path: Path) -> None:
+    source = tmp_path / "source.tif"
+    write_raster(source)
+    gdf = gdf_with_assets({"vv": (str(source), _GEOTIFF)})
+
+    _download(gdf, tmp_path, assets=["vv"], process=True)
+
+    (meta,) = (tmp_path / "out" / "metadata").glob("*.gpkg")
+    assert "subset_bbox" not in gpd.read_file(meta).columns
+
+
+@pytest.mark.unit
+def test_area_with_process_behaves_like_area_alone(raster_gdf, tmp_path: Path) -> None:
+    area = lonlat(_INNER_UTM)
+
+    alone = _download(raster_gdf, tmp_path / "a", assets=["vv"], bbox=area)
+    both = _download(
+        raster_gdf, tmp_path / "b", assets=["vv"], bbox=area, process=True
+    )
+
+    alone_path = alone.iloc[0]["local_paths"]["vv"]
+    both_path = both.iloc[0]["local_paths"]["vv"]
+    assert both_path.name == alone_path.name
+    with rasterio.open(alone_path) as a, rasterio.open(both_path) as b:
+        assert a.bounds == b.bounds
+        np.testing.assert_array_equal(a.read(), b.read())
