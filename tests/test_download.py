@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import geopandas as gpd
 import httpx
 import pytest
 import respx
@@ -236,6 +237,8 @@ def test_download_items_saves_metadata(sample_gdf, tmp_path: Path) -> None:
 
     meta_files = list((tmp_path / "metadata").glob("*.gpkg"))
     assert len(meta_files) >= 1
+    saved = gpd.read_file(meta_files[0])
+    assert not {"assets", "asset_roles", "asset_types"} & set(saved.columns)
 
 
 @pytest.mark.unit

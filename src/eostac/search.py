@@ -73,7 +73,8 @@ def search_items(
     geopandas.GeoDataFrame
         Columns: ``geometry``, ``item_id``, ``collection``, ``datetime``,
         ``cloud_cover`` (normalised 0–100 if present), ``assets`` (dict of
-        key → href), ``asset_roles`` (dict of key → roles), plus all other
+        key → href), ``asset_roles`` (dict of key → roles), ``asset_types``
+        (dict of key → media type, ``""`` when undeclared), plus all other
         flattened STAC properties.
     """
     query = {**(params.to_query() if params is not None else {}), **(extra_query or {})}
@@ -245,6 +246,7 @@ _CORE_COLUMNS = [
     "datetime",
     "assets",
     "asset_roles",
+    "asset_types",
 ]
 
 # Cloud-cover appears under several raw keys; all normalise to a 0–100 ``cloud_cover``.
@@ -268,6 +270,10 @@ def _items_to_gdf(items: list[pystac.Item]) -> gpd.GeoDataFrame:
             key: list(asset.roles or []) for key, asset in item.assets.items()
         }
 
+        asset_types = {
+            key: asset.media_type or "" for key, asset in item.assets.items()
+        }
+
         row: dict[str, object] = {
             "geometry": geom,
             "item_id": item.id,
@@ -275,6 +281,7 @@ def _items_to_gdf(items: list[pystac.Item]) -> gpd.GeoDataFrame:
             "datetime": item.datetime,
             "assets": assets,
             "asset_roles": asset_roles,
+            "asset_types": asset_types,
         }
 
         # Flatten every property under its namespace-stripped name, so the schema

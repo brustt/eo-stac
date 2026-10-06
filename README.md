@@ -95,7 +95,7 @@ gdf = search_items(
 )
 ```
 
-Returns a `GeoDataFrame` with columns: `geometry`, `item_id`, `collection`, `datetime`, `cloud_cover`, `assets` (dict of key → href), `asset_roles` (dict of key → STAC roles), plus all other flattened STAC properties.
+Returns a `GeoDataFrame` with columns: `geometry`, `item_id`, `collection`, `datetime`, `cloud_cover`, `assets` (dict of key → href), `asset_roles` (dict of key → STAC roles), `asset_types` (dict of key → media type), plus all other flattened STAC properties.
 
 `params` takes a `SearchParams` subclass: `Sentinel2Params`, `LandsatParams`, `Sentinel1Params`, `DEMParams` (or the generic `OpticalParams` / `SARParams`). All filtering happens server-side.
 

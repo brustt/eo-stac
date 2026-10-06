@@ -23,6 +23,9 @@ from eostac.storage import PathManager
 _RETRY_COUNT = 3
 _CHUNK_SIZE = 1 << 20  # 1 MiB
 
+# Dict-valued columns that a GeoPackage cannot store.
+_UNSERIALISABLE_COLUMNS = ("assets", "asset_roles", "asset_types", "local_paths")
+
 # HTTP statuses worth retrying, besides every 5xx.
 _RETRYABLE_STATUSES = frozenset({408, 429})
 # Upper bound on how long a server's Retry-After can make one download wait.
@@ -483,7 +486,7 @@ def _save_metadata(gdf: gpd.GeoDataFrame, path: Path) -> None:
     try:
         serialisable = gdf.drop(
             columns=[
-                c for c in ("assets", "asset_roles", "local_paths") if c in gdf.columns
+                c for c in _UNSERIALISABLE_COLUMNS if c in gdf.columns
             ],
             errors="ignore",
         )

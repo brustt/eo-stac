@@ -7,6 +7,7 @@ import warnings
 from datetime import datetime, timezone
 
 import geopandas as gpd
+import pystac
 import pytest
 import responses as resp_lib
 
@@ -277,3 +278,20 @@ def test_zero_results_no_warning_when_property_exists() -> None:
         warnings.simplefilter("error")
         gdf = search_items(source, params=OpticalParams(max_cloud_cover=1))
     assert len(gdf) == 0
+
+
+@pytest.mark.unit
+def test_items_to_gdf_keeps_asset_media_types(sample_item) -> None:
+    sample_item.add_asset("manifest", pystac.Asset(href="https://example.com/m"))
+    gdf = _items_to_gdf([sample_item])
+    assert gdf.iloc[0]["asset_types"] == {
+        "B04": "image/tiff",
+        "B03": "image/tiff",
+        "thumbnail": "image/jpeg",
+        "manifest": "",
+    }
+
+
+@pytest.mark.unit
+def test_items_to_gdf_empty_has_asset_types_column() -> None:
+    assert "asset_types" in _items_to_gdf([]).columns
