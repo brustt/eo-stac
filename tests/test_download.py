@@ -301,7 +301,7 @@ async def test_download_raw_retries_on_error_and_succeeds(mock_sleep, tmp_path: 
 
     assert result == dest
     assert call_count == 2
-    mock_sleep.assert_called_once_with(1)  # 2**0 = 1 before second attempt
+    mock_sleep.assert_called_once()  # one backoff before the second attempt
 
 
 @pytest.mark.unit

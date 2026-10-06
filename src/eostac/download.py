@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import time
-from collections.abc import Callable
+import random
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -20,6 +21,11 @@ from eostac.storage import PathManager
 
 _RETRY_COUNT = 3
 _CHUNK_SIZE = 1 << 20  # 1 MiB
+
+# HTTP statuses worth retrying, besides every 5xx.
+_RETRYABLE_STATUSES = frozenset({408, 429})
+# Upper bound on how long a server's Retry-After can make one download wait.
+_MAX_RETRY_AFTER = 300.0
 
 # Roles marking an asset as a service endpoint rather than a downloadable file.
 _NON_DOWNLOADABLE_ROLES = frozenset({"tiles"})
@@ -210,17 +216,10 @@ async def _run_downloads(
 
         async def run_one(row_idx: int, key: str, href: str, dest: Path) -> tuple:
             async with sem:
-                if sign is not None and (overwrite or not dest.exists()):
-                    try:
-                        href = await asyncio.to_thread(sign, href)
-                    except Exception as exc:
-                        raise DownloadError(f"Failed to sign {href}: {exc}") from exc
                 if process:
-                    path = await asyncio.to_thread(
-                        _download_processed_sync, href, dest, overwrite
-                    )
+                    path = await _download_processed(href, dest, overwrite, sign)
                 else:
-                    path = await _download_raw(client, href, dest, overwrite)
+                    path = await _download_raw(client, href, dest, overwrite, sign)
                 return row_idx, key, path
 
         aws = [run_one(row_idx, key, href, dest) for row_idx, key, href, dest in tasks]
@@ -243,68 +242,154 @@ async def _run_downloads(
 
 
 # ---------------------------------------------------------------------------
+# Retry policy
+# ---------------------------------------------------------------------------
+
+
+class _Transient(Exception):
+    """A failure worth retrying (server overload, rate limit, dropped connection)."""
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class _Permanent(Exception):
+    """A failure that a retry cannot fix (missing file, refused access)."""
+
+
+def _is_retryable_status(status: int) -> bool:
+    return status in _RETRYABLE_STATUSES or status >= 500
+
+
+def _retry_after(resp: httpx.Response) -> float | None:
+    """Return the ``Retry-After`` delay in seconds, if the server sent one."""
+    value = resp.headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+def _raise_for_status(resp: httpx.Response) -> None:
+    status = resp.status_code
+    if status < 400:
+        return
+    if _is_retryable_status(status):
+        raise _Transient(f"HTTP {status}", _retry_after(resp))
+    raise _Permanent(f"HTTP {status}")
+
+
+def _backoff(attempt: int, retry_after: float | None) -> float:
+    """Exponential delay with jitter, never shorter than the server's request."""
+    delay = 2 ** (attempt - 1) + random.random()
+    if retry_after is not None:
+        delay = max(delay, min(retry_after, _MAX_RETRY_AFTER))
+    return delay
+
+
+async def _signed(sign: Callable[[str], str] | None, href: str) -> str:
+    if sign is None:
+        return href
+    try:
+        return await asyncio.to_thread(sign, href)
+    except Exception as exc:
+        raise DownloadError(f"Failed to sign {href}: {exc}") from exc
+
+
+async def _with_retries(href: str, attempt_once: Callable[[], Awaitable[Path]]) -> Path:
+    """Run *attempt_once* until it succeeds, retrying transient failures only."""
+    for attempt in range(1, _RETRY_COUNT + 1):
+        try:
+            return await attempt_once()
+        except DownloadError:
+            raise
+        except (_Transient, httpx.TransportError) as exc:
+            reason = str(exc) or type(exc).__name__
+            if attempt == _RETRY_COUNT:
+                raise DownloadError(
+                    f"Failed to download {href}: {reason} "
+                    f"(after {_RETRY_COUNT} attempts)"
+                ) from exc
+            await asyncio.sleep(_backoff(attempt, getattr(exc, "retry_after", None)))
+        except Exception as exc:
+            reason = str(exc) or type(exc).__name__
+            raise DownloadError(
+                f"Failed to download {href}: {reason} (not retried)"
+            ) from exc
+
+    raise DownloadError(f"Exhausted retries for {href}")  # pragma: no cover
+
+
+# ---------------------------------------------------------------------------
 # Download implementations
 # ---------------------------------------------------------------------------
 
 
 async def _download_raw(
-    client: httpx.AsyncClient, href: str, dest: Path, overwrite: bool = False
+    client: httpx.AsyncClient,
+    href: str,
+    dest: Path,
+    overwrite: bool = False,
+    sign: Callable[[str], str] | None = None,
 ) -> Path:
-    """Stream *href* to *dest* with retry and resume support."""
+    """Stream *href* to *dest*, signing it afresh on every attempt."""
     if dest.exists() and not overwrite:
         return dest
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
 
-    for attempt in range(_RETRY_COUNT):
-        try:
-            async with client.stream("GET", href, timeout=60) as resp:
-                resp.raise_for_status()
-                with open(tmp, "wb") as fh:
-                    async for chunk in resp.aiter_bytes(chunk_size=_CHUNK_SIZE):
-                        fh.write(chunk)
-            tmp.rename(dest)
-            return dest
-        except Exception as exc:
-            if attempt < _RETRY_COUNT - 1:
-                await asyncio.sleep(2**attempt)
-            else:
-                if tmp.exists():
-                    tmp.unlink()
-                raise DownloadError(f"Failed to download {href}: {exc}") from exc
-
-    raise DownloadError(f"Exhausted retries for {href}")  # pragma: no cover
-
-
-def _download_processed_sync(href: str, dest: Path, overwrite: bool = False) -> Path:
-    """Download *href* and re-encode as COG GeoTIFF via rioxarray (runs in thread)."""
-    if dest.exists() and not overwrite:
+    async def attempt_once() -> Path:
+        url = await _signed(sign, href)
+        async with client.stream("GET", url, timeout=60) as resp:
+            _raise_for_status(resp)
+            with open(tmp, "wb") as fh:
+                async for chunk in resp.aiter_bytes(chunk_size=_CHUNK_SIZE):
+                    fh.write(chunk)
+        tmp.replace(dest)
         return dest
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    return await _with_retries(href, attempt_once)
 
+
+async def _download_processed(
+    href: str,
+    dest: Path,
+    overwrite: bool = False,
+    sign: Callable[[str], str] | None = None,
+) -> Path:
+    """Re-encode *href* as a COG GeoTIFF via rioxarray, in a worker thread."""
+    cog_path = dest.with_suffix(".tif")
+    if cog_path.exists() and not overwrite:
+        return cog_path
+
+    cog_path.parent.mkdir(parents=True, exist_ok=True)
+
+    async def attempt_once() -> Path:
+        url = await _signed(sign, href)
+        await asyncio.to_thread(_write_cog, url, cog_path)
+        return cog_path
+
+    return await _with_retries(href, attempt_once)
+
+
+def _write_cog(href: str, cog_path: Path) -> None:
     import rioxarray  # noqa: F401
     import xarray as xr
 
-    for attempt in range(_RETRY_COUNT):
-        try:
-            ds = xr.open_dataset(href, engine="rasterio")
-            cog_path = dest.with_suffix(".tif")
-            try:
-                ds.rio.to_raster(str(cog_path), driver="COG", compress="DEFLATE")
-            finally:
-                ds.close()
-            return cog_path
-        except Exception as exc:
-            if attempt < _RETRY_COUNT - 1:
-                time.sleep(2**attempt)
-            else:
-                raise DownloadError(
-                    f"Failed to process {href} as COG: {exc}"
-                ) from exc
-
-    raise DownloadError(f"Exhausted retries for {href}")  # pragma: no cover
+    ds = xr.open_dataset(href, engine="rasterio")
+    try:
+        ds.rio.to_raster(str(cog_path), driver="COG", compress="DEFLATE")
+    finally:
+        ds.close()
 
 
 # ---------------------------------------------------------------------------
