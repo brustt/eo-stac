@@ -17,7 +17,8 @@ Every measurement starts from an empty directory, deleted afterwards, so
 Skip-existing and Resume never shorten a run.
 
 Data volume: a Sentinel-1 GRD ``vv`` file is about 0.66 GB, so each pass over
-the default 8 files is roughly 5 GB.  In total, ``workers`` transfers ~16 GB, ``writes`` ~11 GB and ``ranges`` ~2 GB:
+the default 8 files is roughly 5 GB.  ``workers`` makes three passes (~16 GB),
+``writes`` two (~11 GB) and ``ranges`` fetches one file three times (~2 GB):
 about 29 GB in total.  Use ``--files 2`` for a quicker run (~9 GB), and
 ``--work-dir`` to pick the disk being measured.
 """
