@@ -17,11 +17,11 @@ ITEM_ID = "S2A_MSIL2A_20200615T101000"
 
 
 @pytest.mark.unit
-def test_item_dir_creates_directory(tmp_path: Path) -> None:
+def test_item_dir_returns_correct_path(tmp_path: Path) -> None:
     pm = PathManager(tmp_path)
     d = pm.item_dir(COLLECTION, ITEM_ID, DATE)
-    assert d.is_dir()
     assert d == tmp_path / COLLECTION / "2020-06-15" / ITEM_ID
+    assert not d.exists()
 
 
 @pytest.mark.unit

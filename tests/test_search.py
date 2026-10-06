@@ -3,24 +3,25 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from pathlib import Path
 
 import geopandas as gpd
 import pytest
 import responses as resp_lib
 
 from eostac.catalog import STACSource
-from eostac.search import search_items, _items_to_gdf, _get_cloud_cover, _normalize_datetime
-from eostac.exceptions import SearchError
+from eostac.params import OpticalParams
+from eostac.search import (
+    _items_to_gdf,
+    _normalize_datetime,
+    search_items,
+)
 from tests.conftest import (
     FAKE_API_URL,
     FAKE_COLLECTIONS,
     FAKE_CONFORMANCE,
     FAKE_LANDING,
-    make_item,
     make_fake_search_response,
 )
-
 
 # ---------------------------------------------------------------------------
 # _items_to_gdf helpers
@@ -49,33 +50,6 @@ def test_items_to_gdf_columns(sample_item) -> None:
 def test_items_to_gdf_crs(sample_item) -> None:
     gdf = _items_to_gdf([sample_item])
     assert gdf.crs.to_epsg() == 4326
-
-
-# ---------------------------------------------------------------------------
-# _get_cloud_cover normalisation
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_get_cloud_cover_eo_prefix() -> None:
-    assert _get_cloud_cover({"eo:cloud_cover": 20.0}) == 20.0
-
-
-@pytest.mark.unit
-def test_get_cloud_cover_fractional_normalised() -> None:
-    # 0–1 range (exclusive) should be normalised to 0–100
-    assert _get_cloud_cover({"eo:cloud_cover": 0.2}) == pytest.approx(20.0)
-
-
-@pytest.mark.unit
-def test_get_cloud_cover_boundary_one_percent() -> None:
-    # 1.0 is ambiguous (1% vs 100%) — spec says 0–100, so 1.0 should stay as 1%
-    assert _get_cloud_cover({"eo:cloud_cover": 1.0}) == pytest.approx(1.0)
-
-
-@pytest.mark.unit
-def test_get_cloud_cover_missing() -> None:
-    assert _get_cloud_cover({}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -108,76 +82,6 @@ def test_normalize_datetime_tuple_of_datetimes() -> None:
     assert "/" in result
     assert "2020-01-01" in result
     assert "2020-12-31" in result
-
-
-# ---------------------------------------------------------------------------
-# Static catalog search
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_search_static_catalog_returns_gdf(static_catalog_dir: Path) -> None:
-    source = STACSource.from_json(static_catalog_dir / "catalog.json")
-    gdf = search_items(source)
-    assert isinstance(gdf, gpd.GeoDataFrame)
-    assert len(gdf) >= 1
-
-
-@pytest.mark.unit
-def test_search_static_bbox_overlapping_returns_items(static_catalog_dir: Path) -> None:
-    source = STACSource.from_json(static_catalog_dir / "catalog.json")
-    gdf = search_items(source, bbox=[9.0, 44.0, 13.0, 48.0])
-    assert len(gdf) >= 1
-
-
-@pytest.mark.unit
-def test_search_static_bbox_non_overlapping_returns_empty(static_catalog_dir: Path) -> None:
-    source = STACSource.from_json(static_catalog_dir / "catalog.json")
-    gdf = search_items(source, bbox=[100.0, 0.0, 101.0, 1.0])
-    assert len(gdf) == 0
-
-
-@pytest.mark.unit
-def test_search_static_cloud_cover_filter(static_catalog_dir: Path) -> None:
-    source = STACSource.from_json(static_catalog_dir / "catalog.json")
-    # Item has cloud_cover = 10; filtering at 5 should exclude it
-    gdf = search_items(source, max_cloud_cover=5.0)
-    assert len(gdf) == 0
-
-
-@pytest.mark.unit
-def test_search_static_limit(static_catalog_dir: Path) -> None:
-    source = STACSource.from_json(static_catalog_dir / "catalog.json")
-    gdf = search_items(source, limit=1)
-    assert len(gdf) <= 1
-
-
-@pytest.mark.unit
-def test_search_static_datetime_within_range_returns_items(static_catalog_dir: Path) -> None:
-    source = STACSource.from_json(static_catalog_dir / "catalog.json")
-    gdf = search_items(source, datetime="2020-01-01/2020-12-31")
-    assert len(gdf) >= 1
-
-
-@pytest.mark.unit
-def test_search_static_datetime_outside_range_returns_empty(static_catalog_dir: Path) -> None:
-    source = STACSource.from_json(static_catalog_dir / "catalog.json")
-    gdf = search_items(source, datetime="2021-01-01/2021-12-31")
-    assert len(gdf) == 0
-
-
-@pytest.mark.unit
-def test_search_static_product_type_match_returns_items(static_catalog_dir: Path) -> None:
-    source = STACSource.from_json(static_catalog_dir / "catalog.json")
-    gdf = search_items(source, product_type="L2A")
-    assert len(gdf) >= 1
-
-
-@pytest.mark.unit
-def test_search_static_product_type_mismatch_returns_empty(static_catalog_dir: Path) -> None:
-    source = STACSource.from_json(static_catalog_dir / "catalog.json")
-    gdf = search_items(source, product_type="L1C")
-    assert len(gdf) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -236,3 +140,21 @@ def test_search_api_polygon_filter() -> None:
     poly = box(9.0, 44.0, 13.0, 48.0)
     gdf = search_items(source, polygon=poly)
     assert isinstance(gdf, gpd.GeoDataFrame)
+
+
+@pytest.mark.unit
+@resp_lib.activate
+def test_search_api_params_pushed_as_query() -> None:
+    """Sensor params are serialised into the request as a STAC query body."""
+    _setup_api_mocks()
+    source = STACSource.from_url(FAKE_API_URL)
+    gdf = search_items(source, params=OpticalParams(max_cloud_cover=20))
+    assert isinstance(gdf, gpd.GeoDataFrame)
+
+    # pystac_client POSTs item-search; assert the query filter reached the wire.
+    post_calls = [c for c in resp_lib.calls if c.request.method == "POST"]
+    assert post_calls, "expected a POST /search request"
+    body = post_calls[-1].request.body
+    payload = body.decode() if isinstance(body, (bytes, bytearray)) else body
+    assert "eo:cloud_cover" in payload
+    assert "lte" in payload

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ import geopandas as gpd
 import httpx
 from tqdm import tqdm
 
+from eostac.aliases import resolve
 from eostac.exceptions import DownloadError
 from eostac.storage import PathManager
 
@@ -27,6 +29,7 @@ def download_items(
     overwrite: bool = False,
     process: bool = False,
     show_progress: bool = True,
+    extra_aliases: dict[str, list[str]] | None = None,
 ) -> gpd.GeoDataFrame:
     """Download assets for every item in *gdf*.
 
@@ -37,8 +40,9 @@ def download_items(
     output_dir:
         Root directory for downloaded files.
     assets:
-        Asset keys to download.  ``None`` selects assets whose role includes
-        ``"data"``, falling back to all assets if none are role-tagged.
+        Band Aliases or raw Asset Keys to download.  Resolution tries the
+        built-in Alias Table first, then the value as a literal Asset Key.
+        ``None`` downloads all assets without alias resolution.
     max_workers:
         Maximum number of concurrent downloads (semaphore size).
     overwrite:
@@ -48,22 +52,22 @@ def download_items(
         (``compress=DEFLATE``).  Slower but normalises the output format.
     show_progress:
         Display a ``tqdm`` progress bar.
+    extra_aliases:
+        Extra entries merged on top of the built-in Alias Table.
+        Format: ``{"alias": ["candidate_key1", "candidate_key2"]}``.
 
     Returns
     -------
     geopandas.GeoDataFrame
         Copy of *gdf* with an additional ``local_paths`` column (dict mapping
-        asset key → local ``Path``).
+        alias/key → local ``Path``).
     """
     coro = _download_items_async(
-        gdf, output_dir, assets, max_workers, overwrite, process, show_progress
+        gdf, output_dir, assets, max_workers, overwrite, process, show_progress,
+        extra_aliases,
     )
     try:
         asyncio.get_running_loop()
-        # Already inside a running event loop (e.g. Jupyter): run in a new
-        # thread so it gets its own loop and asyncio.run() works normally.
-        import concurrent.futures
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(asyncio.run, coro).result()
     except RuntimeError:
@@ -78,17 +82,16 @@ async def _download_items_async(
     overwrite: bool = False,
     process: bool = False,
     show_progress: bool = True,
+    extra_aliases: dict[str, list[str]] | None = None,
 ) -> gpd.GeoDataFrame:
-    """Async implementation of :func:`download_items`."""
     pm = PathManager(output_dir)
     gdf = gdf.copy()
     gdf["local_paths"] = [{} for _ in gdf.index]
 
-    # Build work list: (row_idx, asset_key, href, dest_path)
     tasks: list[tuple[int, str, str, Path]] = []
     for idx, row in gdf.iterrows():
         item_assets: dict[str, str] = row.get("assets") or {}
-        selected = _select_assets(item_assets, assets)
+        selected = _select_assets(item_assets, assets, extra_aliases, row.get("item_id", str(idx)))
 
         item_id = row.get("item_id", str(idx))
         collection = row.get("collection") or "unknown"
@@ -100,9 +103,7 @@ async def _download_items_async(
             tasks.append((idx, key, href, dest))
 
     results, errors = await _run_downloads(tasks, process, max_workers, overwrite, show_progress)
-    
 
-    # Write results back to GDF
     for (row_idx, key), local_path in results.items():
         gdf.at[row_idx, "local_paths"][key] = local_path
 
@@ -114,8 +115,7 @@ async def _download_items_async(
             stacklevel=2,
         )
 
-    # Persist GeoDataFrame as GeoPackage
-    meta_name = f"search_results_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
+    meta_name = f"search_results_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H%M%S')}"
     _save_metadata(gdf, pm.metadata_path(meta_name))
 
     return gdf
@@ -129,13 +129,38 @@ async def _download_items_async(
 def _select_assets(
     item_assets: dict[str, str],
     requested: list[str] | None,
+    extra_aliases: dict[str, list[str]] | None,
+    item_id: str,
 ) -> dict[str, str]:
-    """Return the subset of assets to download."""
+    """Return resolved ``{alias_or_key: href}`` dict.
+
+    When *requested* is ``None``, returns all assets without Resolution.
+    Raises :exc:`~eostac.exceptions.DownloadError` if any requested alias or
+    key cannot be resolved against *item_assets*.
+    """
     if not item_assets:
         return {}
-    if requested is not None:
-        return {k: v for k, v in item_assets.items() if k in requested}
-    return item_assets
+    if requested is None:
+        return item_assets
+
+    result: dict[str, str] = {}
+    missing: list[str] = []
+
+    for alias in requested:
+        try:
+            key, href = resolve(alias, item_assets, extra_aliases)
+            result[key] = href
+        except KeyError:
+            missing.append(alias)
+
+    if missing:
+        available = list(item_assets)
+        raise DownloadError(
+            f"Item {item_id!r}: cannot resolve asset(s) {missing!r}. "
+            f"Available asset keys: {available!r}"
+        )
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +252,7 @@ def _download_processed_sync(href: str, dest: Path, overwrite: bool = False) -> 
 
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    import rioxarray  # noqa: F401  — activates the rio accessor
+    import rioxarray  # noqa: F401
     import xarray as xr
 
     for attempt in range(_RETRY_COUNT):
@@ -256,7 +281,6 @@ def _download_processed_sync(href: str, dest: Path, overwrite: bool = False) -> 
 
 
 def _save_metadata(gdf: gpd.GeoDataFrame, path: Path) -> None:
-    """Save GeoDataFrame to GeoPackage, skipping non-serialisable columns."""
     try:
         serialisable = gdf.drop(
             columns=[c for c in ("assets", "local_paths") if c in gdf.columns],

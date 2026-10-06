@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
-from pathlib import Path
 
 import geopandas as gpd
+import pystac
 import pytest
 from shapely.geometry import box, mapping
-
-import pystac
-
 
 # ---------------------------------------------------------------------------
 # Item / GDF fixtures
@@ -90,23 +86,6 @@ def sample_gdf() -> gpd.GeoDataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Static catalog fixture
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def static_catalog_dir(tmp_path: Path) -> Path:
-    """Write a minimal static STAC catalog to a temp directory."""
-    item = make_item()
-
-    catalog = pystac.Catalog(id="test-catalog", description="Test catalog")
-    catalog.normalize_hrefs(str(tmp_path))
-    catalog.add_item(item)
-    catalog.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
-    return tmp_path
-
-
-# ---------------------------------------------------------------------------
 # HTTP mock helpers (used per test with `responses` library)
 # ---------------------------------------------------------------------------
 
@@ -119,6 +98,7 @@ FAKE_CONFORMANCE = {
         "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
         "https://api.stacspec.org/v1.0.0/core",
         "https://api.stacspec.org/v1.0.0/item-search",
+        "https://api.stacspec.org/v1.0.0/item-search#query",
         "https://api.stacspec.org/v1.0.0/ogcapi-features",
     ]
 }

@@ -160,8 +160,12 @@ def quick_view(
     -------
     folium.Map
     """
+    import base64
+    import io
+
     import numpy as np
     import rioxarray
+    from PIL import Image
 
     href = str(path_or_href)
     open_kwargs: dict[str, object] = {}
@@ -186,10 +190,6 @@ def quick_view(
         arr = ((arr - arr_min) / (arr_max - arr_min) * 255).astype(np.uint8)
     else:
         arr = np.zeros_like(arr, dtype=np.uint8)
-
-    from PIL import Image
-    import io
-    import base64
 
     img = Image.fromarray(arr.squeeze() if arr.shape[-1] == 1 else arr)
     buffer = io.BytesIO()

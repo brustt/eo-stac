@@ -48,18 +48,41 @@ def test_href_suffix_fallback() -> None:
 @pytest.mark.unit
 def test_select_assets_all_when_none() -> None:
     assets = {"B04": "https://ex.com/B04.tif", "B03": "https://ex.com/B03.tif"}
-    assert _select_assets(assets, None) == assets
+    assert _select_assets(assets, None, None, "item-1") == assets
 
 
 @pytest.mark.unit
 def test_select_assets_filter_by_keys() -> None:
     assets = {"B04": "url1", "B03": "url2", "B02": "url3"}
-    assert _select_assets(assets, ["B04", "B02"]) == {"B04": "url1", "B02": "url3"}
+    assert _select_assets(assets, ["B04", "B02"], None, "item-1") == {"B04": "url1", "B02": "url3"}
 
 
 @pytest.mark.unit
 def test_select_assets_empty_item_assets() -> None:
-    assert _select_assets({}, None) == {}
+    assert _select_assets({}, None, None, "item-1") == {}
+
+
+@pytest.mark.unit
+def test_select_assets_alias_resolution() -> None:
+    assets = {"B04": "url_red", "B08": "url_nir"}
+    result = _select_assets(assets, ["red", "nir"], None, "item-1")
+    assert result == {"red": "url_red", "nir": "url_nir"}
+
+
+@pytest.mark.unit
+def test_select_assets_alias_not_found_raises() -> None:
+    from eostac.exceptions import DownloadError
+    assets = {"VV": "url_vv"}
+    with pytest.raises(DownloadError, match="nir"):
+        _select_assets(assets, ["nir"], None, "item-1")
+
+
+@pytest.mark.unit
+def test_select_assets_extra_aliases() -> None:
+    assets = {"my_red_band": "url_red"}
+    extra = {"red": ["my_red_band"]}
+    result = _select_assets(assets, ["red"], extra, "item-1")
+    assert result == {"red": "url_red"}
 
 
 # ---------------------------------------------------------------------------

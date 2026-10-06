@@ -27,14 +27,9 @@ class PathManager:
         self.root = Path(root_dir)
 
     def item_dir(self, collection: str, item_id: str, date: datetime | None) -> Path:
-        """Return (and create) the directory for a single item's assets."""
+        """Return the directory path for a single item's assets (does not create it)."""
         date_str = date.strftime("%Y-%m-%d") if date is not None else "unknown-date"
-        path = self.root / collection / date_str / item_id
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise StorageError(f"Cannot create item directory {path}: {exc}") from exc
-        return path
+        return self.root / collection / date_str / item_id
 
     def asset_path(
         self,
