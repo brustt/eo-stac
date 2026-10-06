@@ -446,6 +446,11 @@ async def _download_raw(
             _raise_for_status(resp)
 
             resuming = resp.status_code == 206
+            if resuming and resp.headers.get("ETag") != etag:
+                # If-Range is not honoured everywhere (Azure Blob ignores it):
+                # never append bytes of a different version of the file.
+                _discard_partial(part, state)
+                raise _Transient("remote file changed during the transfer")
             if resuming and _content_range_start(resp) != offset:
                 _discard_partial(part, state)
                 raise _Transient("server resumed from an unexpected offset")

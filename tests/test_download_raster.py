@@ -305,7 +305,9 @@ def test_polygon_is_reduced_to_its_bounding_box(raster_gdf, tmp_path: Path) -> N
     west, south, east, north = lonlat(_INNER_UTM)
     triangle = Polygon([(west, south), (east, south), (west, north)])
 
-    from_polygon = _download(raster_gdf, tmp_path / "a", assets=["vv"], polygon=triangle)
+    from_polygon = _download(
+        raster_gdf, tmp_path / "a", assets=["vv"], polygon=triangle
+    )
     from_bbox = _download(
         raster_gdf, tmp_path / "b", assets=["vv"], bbox=list(triangle.bounds)
     )

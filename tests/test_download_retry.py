@@ -331,3 +331,27 @@ def test_fully_received_partial_file_is_recovered(
     result = _download_b04(sample_gdf, tmp_path)
 
     assert _b04_path(result).read_bytes() == b"complete"
+
+
+@pytest.mark.unit
+@respx.mock
+@patch("asyncio.sleep", new_callable=AsyncMock)
+def test_server_ignoring_if_range_does_not_splice_a_changed_file(
+    mock_sleep, sample_gdf, tmp_path: Path
+) -> None:
+    # Some servers (Azure Blob) ignore If-Range and answer 206 for the new file.
+    respx.get(_B04).mock(
+        side_effect=[
+            _dropped(b"old old "),
+            httpx.Response(
+                206,
+                headers={"ETag": '"v2"', "Content-Range": "bytes 8-10/11"},
+                content=b"ile",
+            ),
+            httpx.Response(200, headers={"ETag": '"v2"'}, content=b"new file!!!"),
+        ]
+    )
+
+    result = _download_b04(sample_gdf, tmp_path)
+
+    assert _b04_path(result).read_bytes() == b"new file!!!"
