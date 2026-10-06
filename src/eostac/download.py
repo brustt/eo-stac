@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import math
 import random
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -26,6 +28,9 @@ _CHUNK_SIZE = 1 << 20  # 1 MiB
 
 # Dict-valued columns that a GeoPackage cannot store.
 _UNSERIALISABLE_COLUMNS = ("assets", "asset_roles", "asset_types", "local_paths")
+
+# Media types of rasters that can have a Subset.
+_RASTER_MEDIA_TYPES = ("image/tiff", "image/jp2")
 
 # HTTP statuses worth retrying, besides every 5xx.
 _RETRYABLE_STATUSES = frozenset({408, 429})
@@ -46,6 +51,7 @@ def download_items(
     show_progress: bool = True,
     extra_aliases: dict[str, list[str]] | None = None,
     sign: Callable[[str], str] | None = None,
+    bbox: Sequence[float] | None = None,
 ) -> gpd.GeoDataFrame:
     """Download assets for every item in *gdf*.
 
@@ -76,6 +82,12 @@ def download_items(
         Callable turning an asset href into a fetchable one, applied just
         before each download — for providers whose hrefs need a short-lived
         token (e.g. ``planetary_computer.sign``).
+    bbox:
+        Area of interest as ``[west, south, east, north]`` in EPSG:4326.  When
+        given, each raster asset is written as a Subset — the part covering
+        the area, as a COG — instead of the provider's whole file.  A Subset
+        keeps the source pixels, CRS and resolution: it is never resampled,
+        and may extend slightly beyond the area.
 
     Returns
     -------
@@ -85,7 +97,7 @@ def download_items(
     """
     coro = _download_items_async(
         gdf, output_dir, assets, max_workers, overwrite, process, show_progress,
-        extra_aliases, sign,
+        extra_aliases, sign, bbox,
     )
     try:
         asyncio.get_running_loop()
@@ -105,12 +117,14 @@ async def _download_items_async(
     show_progress: bool = True,
     extra_aliases: dict[str, list[str]] | None = None,
     sign: Callable[[str], str] | None = None,
+    bbox: Sequence[float] | None = None,
 ) -> gpd.GeoDataFrame:
     pm = PathManager(output_dir)
+    area = tuple(float(v) for v in bbox) if bbox is not None else None
     gdf = gdf.copy()
     gdf["local_paths"] = [{} for _ in gdf.index]
 
-    tasks: list[tuple[int, str, str, Path]] = []
+    tasks: list[_Task] = []
     for idx, row in gdf.iterrows():
         item_assets: dict[str, str] = row.get("assets") or {}
         selected = _select_assets(
@@ -125,10 +139,19 @@ async def _download_items_async(
         collection = row.get("collection") or "unknown"
         item_dt: datetime | None = row.get("datetime")
 
+        # Resolution may map a Band Alias onto an Asset Key; media types are
+        # recorded per Asset Key, so look them up by href.
+        asset_types: dict[str, str] = row.get("asset_types") or {}
+        type_by_href = {item_assets[k]: t for k, t in asset_types.items()}
+
         for key, href in selected.items():
-            suffix = _href_suffix(href)
-            dest = pm.asset_path(collection, item_id, item_dt, key, suffix=suffix)
-            tasks.append((idx, key, href, dest))
+            if area is not None and _is_raster(type_by_href.get(href)):
+                dest = pm.subset_path(collection, item_id, item_dt, key, area)
+                tasks.append(_Task(idx, key, href, dest, area))
+            else:
+                suffix = _href_suffix(href)
+                dest = pm.asset_path(collection, item_id, item_dt, key, suffix=suffix)
+                tasks.append(_Task(idx, key, href, dest))
 
     results, errors = await _run_downloads(
         tasks, process, max_workers, overwrite, show_progress, sign
@@ -154,6 +177,21 @@ async def _download_items_async(
 # ---------------------------------------------------------------------------
 # Asset selection
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Task:
+    """One asset to fetch.  *area* is set when a Subset is wanted."""
+
+    row_idx: int
+    key: str
+    href: str
+    dest: Path
+    area: tuple[float, ...] | None = None
+
+
+def _is_raster(media_type: str | None) -> bool:
+    return bool(media_type) and media_type.startswith(_RASTER_MEDIA_TYPES)
 
 
 def _select_assets(
@@ -206,7 +244,7 @@ def _select_assets(
 
 
 async def _run_downloads(
-    tasks: list[tuple[int, str, str, Path]],
+    tasks: list[_Task],
     process: bool,
     max_workers: int,
     overwrite: bool,
@@ -219,15 +257,19 @@ async def _run_downloads(
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
 
-        async def run_one(row_idx: int, key: str, href: str, dest: Path) -> tuple:
+        async def run_one(task: _Task) -> tuple:
             async with sem:
-                if process:
-                    path = await _download_processed(href, dest, overwrite, sign)
+                if task.area is not None or process:
+                    path = await _download_as_cog(
+                        task.href, task.dest, overwrite, sign, task.area
+                    )
                 else:
-                    path = await _download_raw(client, href, dest, overwrite, sign)
-                return row_idx, key, path
+                    path = await _download_raw(
+                        client, task.href, task.dest, overwrite, sign
+                    )
+                return task.row_idx, task.key, path
 
-        aws = [run_one(row_idx, key, href, dest) for row_idx, key, href, dest in tasks]
+        aws = [run_one(task) for task in tasks]
 
         pbar = tqdm(
             asyncio.as_completed(aws),
@@ -316,6 +358,10 @@ async def _with_retries(href: str, attempt_once: Callable[[], Awaitable[Path]]) 
             return await attempt_once()
         except DownloadError:
             raise
+        except (httpx.UnsupportedProtocol, httpx.InvalidURL) as exc:
+            raise DownloadError(
+                f"Failed to download {href}: {exc} (not retried)"
+            ) from exc
         except (_Transient, httpx.TransportError) as exc:
             reason = str(exc) or type(exc).__name__
             if attempt == _RETRY_COUNT:
@@ -446,13 +492,14 @@ def _content_range_start(resp: httpx.Response) -> int | None:
         return None
 
 
-async def _download_processed(
+async def _download_as_cog(
     href: str,
     dest: Path,
     overwrite: bool = False,
     sign: Callable[[str], str] | None = None,
+    area: tuple[float, ...] | None = None,
 ) -> Path:
-    """Re-encode *href* as a COG GeoTIFF, in a worker thread."""
+    """Write *href*, or its Subset over *area*, as a COG in a worker thread."""
     cog_path = dest.with_suffix(".tif")
     if cog_path.exists() and not overwrite:
         return cog_path
@@ -461,7 +508,7 @@ async def _download_processed(
 
     async def attempt_once() -> Path:
         url = await _signed(sign, href)
-        await asyncio.to_thread(_write_cog, url, cog_path)
+        await asyncio.to_thread(_write_cog, url, cog_path, area)
         return cog_path
 
     return await _with_retries(href, attempt_once)
@@ -474,20 +521,28 @@ async def _download_processed(
 _GDAL_HTTP_STATUS = re.compile(r"HTTP (?:error|response) code\s*:\s*(\d{3})")
 
 
-def _write_cog(href: str, cog_path: Path) -> None:
+def _write_cog(
+    href: str, cog_path: Path, area: tuple[float, ...] | None = None
+) -> None:
     """Copy the raster at *href* to *cog_path* as a COG, with flat memory use.
 
     GDAL streams the copy block by block, so the full array is never held in
     memory.  Data type, nodata and georeferencing are those of the source.
+    With *area* (EPSG:4326 bounds), only the Subset covering it is written.
     """
     import rasterio
     from rasterio.errors import RasterioIOError
     from rasterio.shutil import copy as rio_copy
 
+    options = {"driver": "COG", "compress": "DEFLATE", "bigtiff": "IF_SAFER"}
     tmp = cog_path.with_suffix(cog_path.suffix + ".part")
     try:
         with rasterio.open(href) as src:
-            rio_copy(src, tmp, driver="COG", compress="DEFLATE", bigtiff="IF_SAFER")
+            if area is None:
+                rio_copy(src, tmp, **options)
+            else:
+                with _subset_view(src, area) as view:
+                    rio_copy(view, tmp, **options)
         tmp.replace(cog_path)
     except RasterioIOError as exc:
         raise _classify_gdal_error(href, exc) from exc
@@ -497,6 +552,43 @@ def _write_cog(href: str, cog_path: Path) -> None:
         raise _classify_gdal_error(href, exc) from exc
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _subset_window(src, area: tuple[float, ...]):
+    """Return the pixel window of *src* covering *area*, snapped outward."""
+    from rasterio.warp import transform_bounds
+    from rasterio.windows import Window, from_bounds
+
+    bounds = transform_bounds("EPSG:4326", src.crs, *area, densify_pts=21)
+    exact = from_bounds(*bounds, transform=src.transform)
+    # Round away float noise before snapping outward to whole source pixels.
+    col_off = math.floor(round(exact.col_off, 6))
+    row_off = math.floor(round(exact.row_off, 6))
+    col_end = math.ceil(round(exact.col_off + exact.width, 6))
+    row_end = math.ceil(round(exact.row_off + exact.height, 6))
+    return Window(col_off, row_off, col_end - col_off, row_end - row_off)
+
+
+def _subset_view(src, area: tuple[float, ...]):
+    """Return a dataset exposing only the Subset of *src* over *area*.
+
+    The view sits on the source pixel grid, in the source CRS, so nearest-
+    neighbour lookup returns each source pixel unchanged: nothing is resampled
+    (ADR 0003).
+    """
+    from rasterio.enums import Resampling
+    from rasterio.vrt import WarpedVRT
+
+    window = _subset_window(src, area)
+    return WarpedVRT(
+        src,
+        crs=src.crs,
+        transform=src.window_transform(window),
+        width=int(window.width),
+        height=int(window.height),
+        resampling=Resampling.nearest,
+        nodata=src.nodata,
+    )
 
 
 def _classify_gdal_error(href: str, exc: Exception) -> Exception:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +20,7 @@ class PathManager:
         │   └── <YYYY-MM-DD>/
         │       └── <item_id>/
         │           ├── <item_id>_<asset_key>.tif
+        │           ├── <item_id>_<asset_key>_sub-<area tag>.tif   (Subsets)
         │           └── ...
         └── metadata/
             └── <name>.gpkg
@@ -44,6 +47,23 @@ class PathManager:
         filename = f"{item_id}_{asset_key}{suffix}"
         return directory / filename
 
+    def subset_path(
+        self,
+        collection: str,
+        item_id: str,
+        date: datetime | None,
+        asset_key: str,
+        area: Sequence[float],
+    ) -> Path:
+        """Return the path for a Subset of an asset over *area*.
+
+        *area* is ``(west, south, east, north)`` in EPSG:4326.  The file name
+        carries a tag derived from it, so Subsets of different areas and the
+        whole file never share a path.
+        """
+        directory = self.item_dir(collection, item_id, date)
+        return directory / f"{item_id}_{asset_key}_sub-{_area_tag(area)}.tif"
+
     def metadata_path(self, name: str) -> Path:
         """Return the path for a GeoPackage metadata file."""
         meta_dir = self.root / "metadata"
@@ -52,3 +72,9 @@ class PathManager:
         except OSError as exc:
             raise StorageError(f"Cannot create metadata directory {meta_dir}: {exc}") from exc
         return meta_dir / f"{name}.gpkg"
+
+
+def _area_tag(area: Sequence[float]) -> str:
+    """Short, stable identifier of an area (coordinates rounded to ~1 cm)."""
+    canonical = ",".join(f"{float(v):.7f}" for v in area)
+    return hashlib.sha1(canonical.encode()).hexdigest()[:8]

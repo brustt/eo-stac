@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -70,3 +71,17 @@ def test_different_dates_different_dirs(tmp_path: Path) -> None:
     assert d1 != d2
     assert "2020-06-15" in str(d1)
     assert "2020-07-20" in str(d2)
+
+
+@pytest.mark.unit
+def test_subset_path_is_deterministic_per_area(tmp_path: Path) -> None:
+    pm = PathManager(tmp_path)
+    date = datetime(2024, 6, 15, tzinfo=timezone.utc)
+    area = (2.2, 48.8, 2.5, 48.9)
+
+    path = pm.subset_path("col", "item-1", date, "vv", area)
+
+    assert path.parent == pm.item_dir("col", "item-1", date)
+    assert re.fullmatch(r"item-1_vv_sub-[0-9a-f]{8}\.tif", path.name)
+    assert pm.subset_path("col", "item-1", date, "vv", [2.2, 48.8, 2.5, 48.9]) == path
+    assert pm.subset_path("col", "item-1", date, "vv", (2.2, 48.8, 2.5, 48.91)) != path
