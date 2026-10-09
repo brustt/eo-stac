@@ -75,7 +75,7 @@ def sample_item() -> pystac.Item:
 @pytest.fixture
 def sample_gdf() -> gpd.GeoDataFrame:
     """GeoDataFrame with 3 items across different cloud covers."""
-    from eostac.search import _items_to_gdf
+    from eo_stac.search import _items_to_gdf
 
     items = [
         make_item("item-001", cloud_cover=5.0, bbox=[10.0, 45.0, 12.0, 47.0]),

@@ -1,12 +1,12 @@
-"""Tests for eostac.catalog.STACSource."""
+"""Tests for eo_stac.catalog.STACSource."""
 
 from __future__ import annotations
 
 import pytest
 import responses as resp_lib
 
-from eostac.catalog import STACSource
-from eostac.exceptions import EostacError
+from eo_stac.catalog import STACSource
+from eo_stac.exceptions import EostacError
 from tests.conftest import (
     FAKE_API_URL,
     FAKE_COLLECTIONS,

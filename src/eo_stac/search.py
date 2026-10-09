@@ -9,15 +9,17 @@ from typing import TYPE_CHECKING, Any, Union
 import geopandas as gpd
 import pystac
 import pystac_client
+from rich.console import Console
+from rich.table import Table
 from shapely.geometry import mapping, shape
 
-from eostac.exceptions import SearchError
-from eostac.params import SearchParams
+from eo_stac.exceptions import SearchError
+from eo_stac.params import SearchParams
 
 if TYPE_CHECKING:
     from shapely.geometry.base import BaseGeometry
 
-    from eostac.catalog import STACSource
+    from eo_stac.catalog import STACSource
 
 
 def search_items(
@@ -29,13 +31,14 @@ def search_items(
     limit: int | None = None,
     params: SearchParams | None = None,
     extra_query: dict[str, dict] | None = None,
+    verbose: bool = True,
 ) -> gpd.GeoDataFrame:
     """Search a STAC API and return matching items as a GeoDataFrame.
 
     Parameters
     ----------
     source:
-        A :class:`~eostac.catalog.STACSource` instance.
+        A :class:`~eo_stac.catalog.STACSource` instance.
     collections:
         Collection IDs to search within.
     bbox:
@@ -50,17 +53,20 @@ def search_items(
         Maximum number of items to return.
     params:
         Sensor-specific filter params.  Pass a subclass of
-        :class:`~eostac.params.SearchParams` — e.g.
+        :class:`~eo_stac.params.SearchParams` — e.g.
         ``Sentinel2Params(max_cloud_cover=20)``,
         ``Sentinel1Params(orbit_state="ascending")``.  Its
-        :meth:`~eostac.params.SearchParams.to_query` output is pushed to the
+        :meth:`~eo_stac.params.SearchParams.to_query` output is pushed to the
         server via the STAC query extension.  Filters the query extension
         cannot express (``polarizations``) are sent as a CQL2 filter instead;
-        :class:`~eostac.exceptions.SearchError` is raised if the API does not
+        :class:`~eo_stac.exceptions.SearchError` is raised if the API does not
         support it.
     extra_query:
         Raw STAC query-extension dict (``{property: {operator: value}}``) for
         provider-specific properties.  Overrides *params* per property.
+    verbose:
+        Print the search parameters and the number of items found to the
+        console.
 
     Warns
     -----
@@ -98,12 +104,55 @@ def search_items(
     except Exception as exc:
         raise SearchError(str(exc)) from exc
 
+    if verbose:
+        _print_summary(
+            spatiotemporal, params, extra_query, predicates, limit, len(items)
+        )
+
     return _items_to_gdf(items)
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _print_summary(
+    spatiotemporal: dict[str, Any],
+    params: SearchParams | None,
+    extra_query: dict[str, dict] | None,
+    predicates: list[dict],
+    limit: int | None,
+    n_items: int,
+) -> None:
+    """Print the search parameters and the item count as a rich table."""
+    table = Table(title="STAC search", show_header=False, title_justify="left")
+    table.add_column(style="bold cyan")
+    table.add_column()
+
+    collections = spatiotemporal["collections"]
+    if collections:
+        table.add_row("collections", ", ".join(collections))
+    if spatiotemporal["polygon"] is not None:
+        table.add_row("polygon", "custom geometry")
+    elif spatiotemporal["bbox"]:
+        table.add_row("bbox", ", ".join(f"{v:.5f}" for v in spatiotemporal["bbox"]))
+    datetime = _normalize_datetime(spatiotemporal["datetime"])
+    if datetime:
+        table.add_row("datetime", datetime)
+    if params is not None:
+        for name, value in vars(params).items():
+            if value is not None:
+                table.add_row(name, str(value))
+    for prop, ops in (extra_query or {}).items():
+        table.add_row(prop, str(ops))
+    if limit is not None:
+        table.add_row("limit", str(limit))
+
+    color = "green" if n_items else "yellow"
+    table.add_section()
+    table.add_row("items found", f"[bold {color}]{n_items}[/]")
+    Console().print(table)
 
 
 def _normalize_datetime(datetime: str | tuple | None) -> str | None:

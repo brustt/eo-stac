@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "eostac"
+name = "eo-stac"
 version = "0.1.0"
 description = "A Python library for searching and downloading satellite imagery via STAC"
 readme = "README.md"
@@ -16,11 +16,14 @@ dependencies = [
     "shapely>=2.0.0",
     "httpx>=0.27.0",
     "tqdm>=4.66.0",
+    "rich>=13.0.0",
     "folium>=0.17.0",
     "Pillow>=10.0.0",
     "ipywidgets>=8.1.8",
     "xarray>=2025.6.1",
     "rasterio>=1.3",
+    "planetary-computer>=1.0.0",
+    "pytest>=9.0.2",
 ]
 
 [project.optional-dependencies]
@@ -38,7 +41,7 @@ bench = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/eostac"]
+packages = ["src/eo_stac"]
 
 [tool.ruff]
 line-length = 88

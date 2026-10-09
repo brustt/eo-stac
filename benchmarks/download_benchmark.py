@@ -36,12 +36,12 @@ from pathlib import Path
 import httpx
 import planetary_computer
 
-from eostac import STACSource, download_items, search_items
+from eo_stac import STACSource, download_items, search_items
 
 _API = "https://planetarycomputer.microsoft.com/api/stac/v1"
 # A fixed, closed query: every matching Item is listed and the first ones by
 # id are kept, so every run measures the same files.
-_COLLECTION = "sentinel-1-grd"
+_COLLECTION = "sentinel-1-rtc"
 _BBOX = [0.0, 44.0, 6.0, 49.0]
 _DATETIME = "2024-06-01/2024-06-07"
 _CHUNK = 1 << 20
@@ -71,7 +71,7 @@ class Measurement:
 
     def __enter__(self) -> "Measurement":
         self.directory = Path(
-            tempfile.mkdtemp(prefix="eostac-bench-", dir=self._work_dir)
+            tempfile.mkdtemp(prefix="eo_stac-bench-", dir=self._work_dir)
         )
         self._start = time.perf_counter()
         return self

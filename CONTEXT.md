@@ -1,4 +1,4 @@
-# eostac
+# eo_stac
 
 A Python library for searching and downloading satellite imagery via STAC. Callers work with semantic band concepts; the library handles provider-specific naming differences at runtime.
 
@@ -82,7 +82,7 @@ _Avoid_: optical filter, cloud filter
 **SARParams**: `SearchParams` subclass for SAR sensors. Adds `orbit_state`, `polarizations`, `instrument_mode`, `product_type`. `polarizations` means the Item carries at least all the listed polarizations.
 _Avoid_: radar params, SAR filter
 
-**Sentinel1Params / Sentinel2Params / LandsatParams / DEMParams**: Leaf classes. Sentinel2Params is a typed alias of OpticalParams (no extra fields — self-documenting + extension point). LandsatParams adds `wrs_path`, `wrs_row`. Sentinel1Params adds `orbit_number`. DEMParams adds `dem_type`.
+**Sentinel1Params / Sentinel2Params / LandsatParams / DEMParams**: Leaf classes. Sentinel2Params is a typed alias of OpticalParams (no extra fields — self-documenting + extension point). LandsatParams adds `wrs_path`, `wrs_row`. Sentinel1Params adds `orbit_number` (an int, or a list to match any). DEMParams adds `dem_type`.
 _Avoid_: sensor config, sensor filter
 
 ## Decisions

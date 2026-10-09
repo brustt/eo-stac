@@ -1,4 +1,4 @@
-"""Tests for eostac.download.download_items()."""
+"""Tests for eo_stac.download.download_items()."""
 
 from __future__ import annotations
 
@@ -10,10 +10,9 @@ import httpx
 import pytest
 import respx
 
-from eostac.download import _download_raw, _href_suffix, _select_assets, download_items
-from eostac.exceptions import DownloadError
-from eostac.storage import PathManager
-
+from eo_stac.download import _download_raw, _href_suffix, _select_assets, download_items
+from eo_stac.exceptions import DownloadError
+from eo_stac.storage import PathManager
 
 _ASSET_URLS = [
     "https://example.com/B04.tif",
@@ -74,7 +73,10 @@ def test_select_assets_explicit_key_ignores_roles() -> None:
 @pytest.mark.unit
 def test_select_assets_filter_by_keys() -> None:
     assets = {"B04": "url1", "B03": "url2", "B02": "url3"}
-    assert _select_assets(assets, ["B04", "B02"], None, "item-1") == {"B04": "url1", "B02": "url3"}
+    assert _select_assets(assets, ["B04", "B02"], None, "item-1") == {
+        "B04": "url1",
+        "B02": "url3",
+    }
 
 
 @pytest.mark.unit
@@ -91,7 +93,8 @@ def test_select_assets_alias_resolution() -> None:
 
 @pytest.mark.unit
 def test_select_assets_alias_not_found_raises() -> None:
-    from eostac.exceptions import DownloadError
+    from eo_stac.exceptions import DownloadError
+
     assets = {"VV": "url_vv"}
     with pytest.raises(DownloadError, match="nir"):
         _select_assets(assets, ["nir"], None, "item-1")
@@ -279,14 +282,18 @@ async def test_download_raw_skips_existing_without_request(tmp_path: Path) -> No
     dest = tmp_path / "existing.tif"
     dest.write_bytes(b"original")
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        result = await _download_raw(client, "https://example.com/file.tif", dest, overwrite=False)
+        result = await _download_raw(
+            client, "https://example.com/file.tif", dest, overwrite=False
+        )
     assert result == dest
     assert dest.read_bytes() == b"original"
 
 
 @pytest.mark.unit
 @patch("asyncio.sleep", new_callable=AsyncMock)
-async def test_download_raw_retries_on_error_and_succeeds(mock_sleep, tmp_path: Path) -> None:
+async def test_download_raw_retries_on_error_and_succeeds(
+    mock_sleep, tmp_path: Path
+) -> None:
     dest = tmp_path / "file.tif"
     call_count = 0
 
@@ -309,7 +316,9 @@ async def test_download_raw_retries_on_error_and_succeeds(mock_sleep, tmp_path: 
 
 @pytest.mark.unit
 @patch("asyncio.sleep", new_callable=AsyncMock)
-async def test_download_raw_raises_after_exhausted_retries(mock_sleep, tmp_path: Path) -> None:
+async def test_download_raw_raises_after_exhausted_retries(
+    mock_sleep, tmp_path: Path
+) -> None:
     dest = tmp_path / "file.tif"
     with respx.mock:
         respx.get("https://example.com/file.tif").mock(

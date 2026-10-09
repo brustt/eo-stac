@@ -86,6 +86,7 @@ class SARParams(SearchParams):
         _add(query, "sat:orbit_state", "eq", self.orbit_state)
         _add(query, "sar:instrument_mode", "eq", self.instrument_mode)
         _add(query, "sar:product_type", "eq", self.product_type)
+
         return query
 
     def to_filter(self) -> list[dict]:
@@ -95,6 +96,7 @@ class SARParams(SearchParams):
             predicates.append(
                 {"op": "a_contains", "args": [prop, list(self.polarizations)]}
             )
+
         return predicates
 
 
@@ -102,11 +104,15 @@ class SARParams(SearchParams):
 class Sentinel1Params(SARParams):
     """Filter params for Sentinel-1."""
 
-    orbit_number: int | None = None  # sat:relative_orbit
+    # sat:relative_orbit — one orbit, or a list to match any of them
+    orbit_number: int | list[int] | None = None
 
     def to_query(self) -> dict[str, dict]:
         query = super().to_query()
-        _add(query, "sat:relative_orbit", "eq", self.orbit_number)
+        if isinstance(self.orbit_number, (list, tuple)):
+            _add(query, "sat:relative_orbit", "in", list(self.orbit_number))
+        else:
+            _add(query, "sat:relative_orbit", "eq", self.orbit_number)
         return query
 
 

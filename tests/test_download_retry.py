@@ -10,7 +10,7 @@ import httpx
 import pytest
 import respx
 
-from eostac.download import download_items
+from eo_stac.download import download_items
 
 _B04 = "https://example.com/B04.tif"
 

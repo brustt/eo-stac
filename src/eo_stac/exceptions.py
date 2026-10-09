@@ -1,5 +1,5 @@
 class EostacError(Exception):
-    """Base exception for all eostac errors."""
+    """Base exception for all eo_stac errors."""
 
 
 class SearchError(EostacError):

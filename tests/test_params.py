@@ -1,10 +1,10 @@
-"""Tests for eostac.params — to_query() STAC query-extension mapping."""
+"""Tests for eo_stac.params — to_query() STAC query-extension mapping."""
 
 from __future__ import annotations
 
 import pytest
 
-from eostac.params import (
+from eo_stac.params import (
     DEMParams,
     LandsatParams,
     OpticalParams,
@@ -90,6 +90,11 @@ def test_to_filter_empty_by_default() -> None:
 
 
 @pytest.mark.unit
+def test_sentinel1_relative_orbit_list_matches_any() -> None:
+    query = Sentinel1Params(orbit_number=[30, 132]).to_query()
+    assert query == {"sat:relative_orbit": {"in": [30, 132]}}
+
+
 def test_sentinel1_adds_relative_orbit() -> None:
     assert Sentinel1Params(orbit_state="ascending", orbit_number=42).to_query() == {
         "sat:orbit_state": {"eq": "ascending"},

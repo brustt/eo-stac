@@ -1,4 +1,4 @@
-# eostac
+# eo-stac
 
 A Python library for searching and downloading satellite imagery via STAC (SpatioTemporal Asset Catalog). Works with any STAC API (HTTP/HTTPS) from any provider — Earth Search, Planetary Computer, CDSE, … — and returns structured GeoDataFrame results with concurrent downloads and folium-based visualization.
 
@@ -11,7 +11,7 @@ uv sync
 ## Quick start
 
 ```python
-from eostac import STACSource, Sentinel2Params, search_items, download_items, viz
+from eo_stac import STACSource, Sentinel2Params, search_items, download_items, viz
 
 # Connect to a STAC API
 source = STACSource.from_url("https://earth-search.aws.element84.com/v1")
@@ -41,7 +41,7 @@ at download time — search results keep plain, non-expiring hrefs.
 
 ```python
 import planetary_computer
-from eostac import STACSource, Sentinel1Params, search_items, download_items
+from eo_stac import STACSource, Sentinel1Params, search_items, download_items
 
 source = STACSource.from_url("https://planetarycomputer.microsoft.com/api/stac/v1")
 
@@ -153,21 +153,26 @@ downloads/
     └── search_results_2020-06-15_120000.gpkg
 ```
 
+### Band aliases
+
+`assets=` accepts provider-neutral band aliases (`"red"`, `"nir"`, `"swir1"`, `"vv"`, `"visual"`, …) as well as raw asset keys. Each alias maps to candidate asset keys, tried in order against every item, so one list works across providers. The built-in mapping is `eo_stac.ALIAS_TABLE`; `eo_stac.resolve()` applies it to an item's assets.
+
 ### `PathManager`
 
 ```python
-from eostac import PathManager
+from eo_stac import PathManager
 
 pm = PathManager("downloads/")
 pm.item_dir(collection, item_id, date)              # → Path
 pm.asset_path(collection, item_id, date, "B04")    # → Path
+pm.subset_path(collection, item_id, date, "B04", bbox)  # → Path (..._B04_sub-<tag>.tif)
 pm.metadata_path("my_search")                       # → Path
 ```
 
 ### `viz`
 
 ```python
-from eostac import viz
+from eo_stac import viz
 
 viz.plot_footprints(gdf, column="cloud_cover")  # footprints coloured by column
 viz.plot_thumbnails(gdf, max_items=9)           # thumbnail image overlays (accepts sign=)

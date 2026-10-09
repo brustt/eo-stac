@@ -1,4 +1,4 @@
-"""Tests for eostac.storage.PathManager."""
+"""Tests for eo_stac.storage.PathManager."""
 
 from __future__ import annotations
 
@@ -8,9 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from eostac.storage import PathManager
-from eostac.exceptions import StorageError
-
+from eo_stac.storage import PathManager
 
 DATE = datetime(2020, 6, 15, tzinfo=timezone.utc)
 COLLECTION = "sentinel-2-l2a"

@@ -71,3 +71,10 @@ desktop.ini
 !.env.example
 *.pem
 *.key
+
+
+CLAUDE.md 
+CONTEXT.md
+
+data/
+notes.md

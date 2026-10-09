@@ -77,8 +77,12 @@ def plot_footprints(
             tooltip=tooltip,
         ).add_to(m)
 
-    m.fit_bounds([[gdf_wgs.total_bounds[1], gdf_wgs.total_bounds[0]],
-                  [gdf_wgs.total_bounds[3], gdf_wgs.total_bounds[2]]])
+    m.fit_bounds(
+        [
+            [gdf_wgs.total_bounds[1], gdf_wgs.total_bounds[0]],
+            [gdf_wgs.total_bounds[3], gdf_wgs.total_bounds[2]],
+        ]
+    )
     return m
 
 
@@ -95,7 +99,7 @@ def plot_thumbnails(
     Parameters
     ----------
     gdf:
-        GeoDataFrame from :func:`~eostac.search.search_items`.
+        GeoDataFrame from :func:`~eo_stac.search.search_items`.
     max_items:
         Maximum number of items to display.
     sign:
@@ -110,7 +114,11 @@ def plot_thumbnails(
     if subset.empty:
         return folium.Map()
 
-    gdf_wgs = subset.to_crs("EPSG:4326") if subset.crs and subset.crs.to_epsg() != 4326 else subset
+    gdf_wgs = (
+        subset.to_crs("EPSG:4326")
+        if subset.crs and subset.crs.to_epsg() != 4326
+        else subset
+    )
 
     centroid = gdf_wgs.geometry.union_all().centroid
     m = folium.Map(location=[centroid.y, centroid.x], zoom_start=6)
@@ -141,8 +149,12 @@ def plot_thumbnails(
                 tooltip=str(row.get("item_id", "")),
             ).add_to(m)
 
-    m.fit_bounds([[gdf_wgs.total_bounds[1], gdf_wgs.total_bounds[0]],
-                  [gdf_wgs.total_bounds[3], gdf_wgs.total_bounds[2]]])
+    m.fit_bounds(
+        [
+            [gdf_wgs.total_bounds[1], gdf_wgs.total_bounds[0]],
+            [gdf_wgs.total_bounds[3], gdf_wgs.total_bounds[2]],
+        ]
+    )
     return m
 
 

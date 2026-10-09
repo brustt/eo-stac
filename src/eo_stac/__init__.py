@@ -1,9 +1,10 @@
-"""eostac — search and download satellite imagery via STAC."""
+"""eo_stac — search and download satellite imagery via STAC."""
 
-from eostac.aliases import ALIAS_TABLE, resolve
-from eostac.catalog import STACSource
-from eostac.download import download_items
-from eostac.params import (
+from eo_stac import viz
+from eo_stac.aliases import ALIAS_TABLE, resolve
+from eo_stac.catalog import STACSource
+from eo_stac.download import download_items
+from eo_stac.params import (
     DEMParams,
     LandsatParams,
     OpticalParams,
@@ -12,9 +13,8 @@ from eostac.params import (
     Sentinel1Params,
     Sentinel2Params,
 )
-from eostac.search import search_items
-from eostac.storage import PathManager
-from eostac import viz
+from eo_stac.search import search_items
+from eo_stac.storage import PathManager
 
 __all__ = [
     "STACSource",

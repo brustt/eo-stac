@@ -1,4 +1,4 @@
-"""Smoke tests for eostac.viz visualization utilities."""
+"""Smoke tests for eo_stac.viz visualization utilities."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import geopandas as gpd
 import numpy as np
 import pytest
 
-from eostac.viz import plot_footprints, plot_thumbnails, quick_view
+from eo_stac.viz import plot_footprints, plot_thumbnails, quick_view
 
 
 @pytest.fixture
@@ -21,9 +21,11 @@ def tiny_geotiff(tmp_path: Path) -> Path:
     path = tmp_path / "test.tif"
     transform = from_bounds(0.0, 0.0, 1.0, 1.0, 8, 8)
     with rasterio.open(
-        str(path), "w",
+        str(path),
+        "w",
         driver="GTiff",
-        width=8, height=8,
+        width=8,
+        height=8,
         count=1,
         dtype=np.uint8,
         crs="EPSG:4326",

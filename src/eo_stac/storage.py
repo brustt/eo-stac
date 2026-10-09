@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
-from eostac.exceptions import StorageError
+from eo_stac.exceptions import StorageError
 
 
 class PathManager:
@@ -70,7 +70,9 @@ class PathManager:
         try:
             meta_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            raise StorageError(f"Cannot create metadata directory {meta_dir}: {exc}") from exc
+            raise StorageError(
+                f"Cannot create metadata directory {meta_dir}: {exc}"
+            ) from exc
         return meta_dir / f"{name}.gpkg"
 
 

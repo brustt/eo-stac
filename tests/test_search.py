@@ -1,4 +1,4 @@
-"""Tests for eostac.search.search_items()."""
+"""Tests for eo_stac.search.search_items()."""
 
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ import pystac
 import pytest
 import responses as resp_lib
 
-from eostac.catalog import STACSource
-from eostac.exceptions import SearchError
-from eostac.params import OpticalParams, Sentinel1Params
-from eostac.search import (
+from eo_stac.catalog import STACSource
+from eo_stac.exceptions import SearchError
+from eo_stac.params import OpticalParams, Sentinel1Params
+from eo_stac.search import (
     _items_to_gdf,
     _normalize_datetime,
     search_items,

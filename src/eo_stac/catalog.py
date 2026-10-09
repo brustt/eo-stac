@@ -6,7 +6,7 @@ import functools
 
 import pystac_client
 
-from eostac.exceptions import EostacError
+from eo_stac.exceptions import EostacError
 
 
 class STACSource:
@@ -24,7 +24,7 @@ class STACSource:
         """Connect to a STAC API endpoint.
 
         Only HTTP/HTTPS URLs are supported.  Local file paths (or ``file://``
-        URLs) raise :class:`~eostac.exceptions.EostacError`.
+        URLs) raise :class:`~eo_stac.exceptions.EostacError`.
         """
         if url.startswith("file://") or (
             not url.startswith("http://") and not url.startswith("https://")

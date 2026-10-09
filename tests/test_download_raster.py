@@ -15,8 +15,8 @@ import respx
 from rasterio.transform import from_origin
 from shapely.geometry import box, mapping
 
-from eostac.download import download_items
-from eostac.search import _items_to_gdf
+from eo_stac.download import download_items
+from eo_stac.search import _items_to_gdf
 
 # A 64×64, 10 m grid in UTM 31N whose top-left corner is (500000, 5400000):
 # x spans 500000–500640, y spans 5399360–5400000.

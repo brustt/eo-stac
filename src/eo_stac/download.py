@@ -22,9 +22,9 @@ from shapely.geometry import shape
 from shapely.geometry.base import BaseGeometry
 from tqdm import tqdm
 
-from eostac.aliases import resolve
-from eostac.exceptions import DownloadError
-from eostac.storage import PathManager
+from eo_stac.aliases import resolve
+from eo_stac.exceptions import DownloadError
+from eo_stac.storage import PathManager
 
 _RETRY_COUNT = 3
 _CHUNK_SIZE = 1 << 20  # 1 MiB
@@ -62,7 +62,7 @@ def download_items(
     Parameters
     ----------
     gdf:
-        GeoDataFrame returned by :func:`~eostac.search.search_items`.
+        GeoDataFrame returned by :func:`~eo_stac.search.search_items`.
     output_dir:
         Root directory for downloaded files.
     assets:
@@ -111,8 +111,16 @@ def download_items(
         alias/key → local ``Path``).
     """
     coro = _download_items_async(
-        gdf, output_dir, assets, max_workers, overwrite, process, show_progress,
-        extra_aliases, sign, _area_bounds(bbox, polygon),
+        gdf,
+        output_dir,
+        assets,
+        max_workers,
+        overwrite,
+        process,
+        show_progress,
+        extra_aliases,
+        sign,
+        _area_bounds(bbox, polygon),
     )
     try:
         asyncio.get_running_loop()
@@ -176,6 +184,9 @@ async def _download_items_async(
                 as_cog = process and area is None
                 tasks.append(_Task(idx, key, href, dest, as_cog=as_cog))
 
+    if show_progress and not overwrite:
+        _report_existing(tasks)
+
     results, errors, skipped = await _run_downloads(
         tasks, max_workers, overwrite, show_progress, sign
     )
@@ -195,7 +206,9 @@ async def _download_items_async(
             stacklevel=2,
         )
 
-    meta_name = f"search_results_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H%M%S')}"
+    meta_name = (
+        f"search_results_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H%M%S')}"
+    )
     _save_metadata(gdf, pm.metadata_path(meta_name), area)
 
     return gdf
@@ -216,6 +229,21 @@ class _Task:
     dest: Path
     area: tuple[float, ...] | None = None
     as_cog: bool = False
+
+
+def _report_existing(tasks: list[_Task]) -> None:
+    """Tell the console which files are already complete or partly downloaded."""
+    for task in tasks:
+        final = task.dest.with_suffix(".tif") if task.as_cog else task.dest
+        if final.exists():
+            tqdm.write(f"Already downloaded, skipping: {final}")
+            continue
+        part = task.dest.with_suffix(task.dest.suffix + ".part")
+        if not task.as_cog and part.exists():
+            tqdm.write(
+                f"Incomplete download ({part.stat().st_size} bytes), "
+                f"will resume: {final}"
+            )
 
 
 def _area_bounds(
@@ -249,7 +277,7 @@ def _select_assets(
 
     When *requested* is ``None``, returns every downloadable asset (those whose
     roles in *asset_roles* do not mark a service endpoint) without Resolution.
-    Raises :exc:`~eostac.exceptions.DownloadError` if any requested alias or
+    Raises :exc:`~eo_stac.exceptions.DownloadError` if any requested alias or
     key cannot be resolved against *item_assets*.
     """
     if not item_assets:
@@ -707,9 +735,7 @@ def _save_metadata(
 ) -> None:
     try:
         serialisable = gdf.drop(
-            columns=[
-                c for c in _UNSERIALISABLE_COLUMNS if c in gdf.columns
-            ],
+            columns=[c for c in _UNSERIALISABLE_COLUMNS if c in gdf.columns],
             errors="ignore",
         )
         if area is not None:
