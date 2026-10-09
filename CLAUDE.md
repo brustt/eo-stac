@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`eostac` — a Python library for searching and downloading satellite imagery via STAC (SpatioTemporal Asset Catalog). It queries any STAC API (HTTP/HTTPS), returns structured GeoDataFrame results, downloads assets concurrently, and provides folium-based visualization utilities.
+`eo_stac` — a Python library for searching and downloading satellite imagery via STAC (SpatioTemporal Asset Catalog). It queries any STAC API (HTTP/HTTPS), returns structured GeoDataFrame results, downloads assets concurrently, and provides folium-based visualization utilities.
 
-Import as: `from eostac import STACSource, search_items, download_items, PathManager, viz`
+Import as: `from eo_stac import STACSource, search_items, download_items, PathManager, viz`
 
 ## Commands
 
@@ -32,7 +32,7 @@ uv run ruff format .
 ## Architecture
 
 ```
-src/eostac/
+src/eo_stac/
 ├── __init__.py      # Public API re-exports
 ├── catalog.py       # STACSource — unified URL/JSON entry point
 ├── search.py        # search_items() → GeoDataFrame
