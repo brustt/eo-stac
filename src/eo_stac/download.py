@@ -184,6 +184,12 @@ async def _download_items_async(
                 as_cog = process and area is None
                 tasks.append(_Task(idx, key, href, dest, as_cog=as_cog))
 
+    # Saved before transferring, so an interrupted run still leaves its manifest.
+    meta_name = (
+        f"search_results_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H%M%S')}"
+    )
+    _save_metadata(gdf, pm.metadata_path(meta_name), area)
+
     if show_progress and not overwrite:
         _report_existing(tasks)
 
@@ -205,11 +211,6 @@ async def _download_items_async(
             f"{len(errors)} asset(s) failed to download:\n" + "\n".join(errors),
             stacklevel=2,
         )
-
-    meta_name = (
-        f"search_results_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H%M%S')}"
-    )
-    _save_metadata(gdf, pm.metadata_path(meta_name), area)
 
     return gdf
 
