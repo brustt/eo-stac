@@ -329,6 +329,17 @@ async def _run_downloads(
     skipped: list[str] = []
     sem = asyncio.Semaphore(max_workers)
 
+    if not overwrite:
+        # Files already on disk are not transfers: keep them out of the progress total.
+        pending = []
+        for task in tasks:
+            final = task.dest.with_suffix(".tif") if task.as_cog else task.dest
+            if final.exists():
+                results[(task.row_idx, task.key)] = final
+            else:
+                pending.append(task)
+        tasks = pending
+
     async with httpx.AsyncClient(follow_redirects=True) as client:
 
         async def run_one(task: _Task) -> tuple:
@@ -522,6 +533,7 @@ async def _download_raw(
 
             # A compressed body cannot be resumed: byte offsets would not match.
             resumable = "Content-Encoding" not in resp.headers
+            expected = _expected_size(resp) if resumable else None
             try:
                 with open(part, "ab" if resuming else "wb", _CHUNK_SIZE) as fh:
                     # Write bytes as they arrive (buffered by the file object)
@@ -531,6 +543,14 @@ async def _download_raw(
             finally:
                 etag = resp.headers.get("ETag") if resumable else None
                 _save_resume_state(part, state, etag)
+
+        # A server may close the connection early without raising: only a file
+        # of the advertised size is promoted to ``dest``.  The partial file is
+        # kept, so the retry resumes from it.
+        if expected is not None and part.stat().st_size != expected:
+            raise _Transient(
+                f"incomplete transfer: got {part.stat().st_size} of {expected} bytes"
+            )
 
         part.replace(dest)
         state.unlink(missing_ok=True)
@@ -587,6 +607,15 @@ def _content_range_start(resp: httpx.Response) -> int | None:
         return int(value.removeprefix("bytes").strip().split("-")[0])
     except ValueError:
         return None
+
+
+def _expected_size(resp: httpx.Response) -> int | None:
+    """Return the full size of the remote file, or ``None`` if not advertised."""
+    if resp.status_code == 206:
+        total = resp.headers.get("Content-Range", "").rpartition("/")[2]
+    else:
+        total = resp.headers.get("Content-Length", "")
+    return int(total) if total.isdigit() else None
 
 
 async def _download_as_cog(
