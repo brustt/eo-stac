@@ -329,3 +329,19 @@ async def test_download_raw_raises_after_exhausted_retries(
                 await _download_raw(client, "https://example.com/file.tif", dest)
     # sleeps before attempt 2 (sleep(1)) and attempt 3 (sleep(2)); raises on attempt 3
     assert mock_sleep.call_count == 2
+
+
+@pytest.mark.unit
+@patch("asyncio.sleep", new_callable=AsyncMock)
+async def test_download_raw_rejects_truncated_body(mock_sleep, tmp_path: Path) -> None:
+    dest = tmp_path / "file.tif"
+    with respx.mock:
+        respx.get("https://example.com/file.tif").mock(
+            return_value=httpx.Response(
+                200, content=b"data", headers={"Content-Length": "10"}
+            )
+        )
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            with pytest.raises(DownloadError):
+                await _download_raw(client, "https://example.com/file.tif", dest)
+    assert not dest.exists()
