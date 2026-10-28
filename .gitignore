@@ -78,3 +78,7 @@ CONTEXT.md
 
 data/
 notes.md
+.claude/
+benchmarks/
+docs/adr/
+docs/specs/
