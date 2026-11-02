@@ -37,7 +37,7 @@ _Avoid_: lookup, translation, mapping
 **Downloadable Asset**: An asset that points to a file rather than a service endpoint — any asset whose STAC roles do not include `tiles`. `assets=None` means every Downloadable Asset in the Item.
 _Avoid_: data asset, real asset, file asset
 
-**Subset**: The part of a raster asset covering a caller-supplied area, written by the library as a new GeoTIFF instead of transferring the Provider's whole file. Only defined for rasters that have a pixel grid in map coordinates. A Subset keeps the source pixels unchanged and may extend slightly beyond the requested area.
+**Subset**: The part of a raster asset covering a caller-supplied area, written by the library as a new GeoTIFF instead of transferring the Provider's whole file. Only defined for rasters that have a pixel grid in map coordinates. A Subset keeps the source pixels unchanged and may extend slightly beyond the requested area. Given a polygon, it keeps the bounding-box shape and grid but writes only the blocks touching the polygon (a sparse tiled GeoTIFF); the other blocks read as nodata.
 _Avoid_: crop, clip, window, extract
 
 **Skip-existing**: A finished local file is not fetched again on a later call.

@@ -517,3 +517,166 @@ def test_area_without_media_types_warns(raster_gdf, tmp_path: Path) -> None:
 def test_bbox_must_have_four_values(raster_gdf, tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="west, south, east, north"):
         _download(raster_gdf, tmp_path, assets=["vv"], bbox=[2.0, 48.0, 3.0])
+
+
+# ---------------------------------------------------------------------------
+# Polygon Subsets — only the blocks touching the polygon are written
+# ---------------------------------------------------------------------------
+
+_BLOCK = 16  # pixels; small so that the 64×64 test raster has a 4×4 block grid
+
+
+@pytest.fixture
+def small_blocks(monkeypatch) -> None:
+    monkeypatch.setattr("eo_stac.download._SPARSE_BLOCK", _BLOCK)
+
+
+def diagonal_polygon():
+    """Two small squares in opposite corners: a big bbox, a small polygon.
+
+    Returned as an EPSG:4326 shapely geometry.
+    """
+    from pyproj import Transformer
+    from shapely.geometry import MultiPolygon
+    from shapely.ops import transform
+
+    corners = MultiPolygon(
+        [
+            box(500020.0, 5399380.0, 500100.0, 5399460.0),
+            box(500540.0, 5399900.0, 500620.0, 5399980.0),
+        ]
+    )
+    to_wgs84 = Transformer.from_crs("EPSG:32631", "EPSG:4326", always_xy=True)
+    return transform(to_wgs84.transform, corners)
+
+
+def _inside_mask(out: rasterio.DatasetReader, polygon) -> np.ndarray:
+    """True where the pixel lies under *polygon* (given in EPSG:4326)."""
+    from pyproj import Transformer
+    from rasterio.features import geometry_mask
+    from shapely.ops import transform
+
+    to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32631", always_xy=True)
+    return geometry_mask(
+        [transform(to_utm.transform, polygon)],
+        out_shape=(out.height, out.width),
+        transform=out.transform,
+        invert=True,
+        all_touched=True,
+    )
+
+
+def _written_blocks(path: Path) -> int:
+    """Number of blocks of *path* that hold data (the rest is sparse)."""
+    with rasterio.open(path) as ds:
+        return sum(
+            1
+            for _, window in ds.block_windows(1)
+            if (ds.read(1, window=window) != ds.nodata).any()
+        )
+
+
+@pytest.mark.unit
+def test_thin_polygon_writes_only_blocks_it_touches(
+    raster_gdf, small_blocks, tmp_path: Path
+) -> None:
+    polygon = diagonal_polygon()
+
+    sparse = _download(raster_gdf, tmp_path / "a", assets=["vv"], polygon=polygon)
+    dense = _download(
+        raster_gdf, tmp_path / "b", assets=["vv"], bbox=list(polygon.bounds)
+    )
+
+    sparse_path = sparse.iloc[0]["local_paths"]["vv"]
+    dense_path = dense.iloc[0]["local_paths"]["vv"]
+    with rasterio.open(sparse_path) as out, rasterio.open(dense_path) as ref:
+        # Same lattice as the bbox Subset.
+        assert (out.shape, out.transform, out.crs) == (
+            ref.shape,
+            ref.transform,
+            ref.crs,
+        )
+        assert out.nodata == ref.nodata
+        # Inside the polygon, pixels are the bbox Subset's own.
+        inside = _inside_mask(out, polygon)
+        assert inside.any()
+        np.testing.assert_array_equal(out.read()[:, inside], ref.read()[:, inside])
+        # Outside, unwritten blocks read as nodata.
+        assert (out.read()[:, ~inside] == out.nodata).any()
+    total_blocks = (out.height // _BLOCK) * (out.width // _BLOCK)
+    assert _written_blocks(sparse_path) < 0.4 * total_blocks
+    assert sparse_path.stat().st_size < dense_path.stat().st_size
+
+
+@pytest.mark.unit
+def test_polygon_filling_its_bbox_gives_the_bbox_subset(
+    raster_gdf, small_blocks, tmp_path: Path
+) -> None:
+    rectangle = box(*lonlat(_INNER_UTM))
+
+    from_polygon = _download(
+        raster_gdf, tmp_path / "a", assets=["vv"], polygon=rectangle
+    )
+    from_bbox = _download(
+        raster_gdf, tmp_path / "b", assets=["vv"], bbox=list(rectangle.bounds)
+    )
+
+    a = from_polygon.iloc[0]["local_paths"]["vv"]
+    b = from_bbox.iloc[0]["local_paths"]["vv"]
+    assert a.name == b.name
+    assert a.read_bytes() == b.read_bytes()
+
+
+@pytest.mark.unit
+def test_compact_polygon_falls_back_to_the_whole_window(
+    raster_gdf, small_blocks, tmp_path: Path
+) -> None:
+    from shapely.geometry import Polygon
+
+    west, south, east, north = lonlat((500020.0, 5399380.0, 500620.0, 5399980.0))
+    # A triangle: half the bbox, but nearly every block still touches it.
+    triangle = Polygon([(west, south), (east, south), (west, north)])
+
+    result = _download(raster_gdf, tmp_path / "a", assets=["vv"], polygon=triangle)
+    dense = _download(
+        raster_gdf, tmp_path / "b", assets=["vv"], bbox=list(triangle.bounds)
+    )
+
+    path = result.iloc[0]["local_paths"]["vv"]
+    with (
+        rasterio.open(path) as out,
+        rasterio.open(dense.iloc[0]["local_paths"]["vv"]) as ref,
+    ):
+        np.testing.assert_array_equal(out.read(), ref.read())
+
+
+@pytest.mark.unit
+def test_subset_of_another_polygon_is_not_reused(
+    raster_gdf, small_blocks, tmp_path: Path
+) -> None:
+    from shapely.affinity import scale
+
+    polygon = diagonal_polygon()
+    # Same bounding box, different shape: the mirror image across the bbox.
+    mirrored = scale(polygon, xfact=-1, origin="center")
+    assert mirrored.bounds == pytest.approx(polygon.bounds, abs=1e-9)
+
+    first = _download(raster_gdf, tmp_path, assets=["vv"], polygon=polygon)
+    second = _download(raster_gdf, tmp_path, assets=["vv"], polygon=mirrored)
+
+    assert first.iloc[0]["local_paths"]["vv"] != second.iloc[0]["local_paths"]["vv"]
+
+
+@pytest.mark.unit
+def test_polygon_is_recorded_in_metadata(
+    raster_gdf, small_blocks, tmp_path: Path
+) -> None:
+    from shapely import wkt
+
+    polygon = diagonal_polygon()
+
+    _download(raster_gdf, tmp_path, assets=["vv"], polygon=polygon)
+
+    (meta,) = (tmp_path / "out" / "metadata").glob("*.gpkg")
+    saved = gpd.read_file(meta)
+    assert wkt.loads(saved.iloc[0]["subset_polygon"]).equals_exact(polygon, 1e-9)

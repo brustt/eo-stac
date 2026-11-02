@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 
 import geopandas as gpd
 import httpx
-from shapely.geometry import shape
+from shapely.geometry import box, shape
 from shapely.geometry.base import BaseGeometry
 from tqdm import tqdm
 
@@ -39,6 +39,13 @@ _RASTER_MEDIA_TYPES = ("image/tiff", "image/jp2")
 _RETRYABLE_STATUSES = frozenset({408, 429})
 # Longest Retry-After worth waiting for; beyond it the asset is given up on.
 _MAX_RETRY_AFTER = 300.0
+
+# Side, in pixels, of the blocks a polygon Subset is made of: a block is written
+# only if it touches the polygon.  Smaller blocks fit the polygon tighter but
+# cost more range requests.
+_SPARSE_BLOCK = 256
+# Above this share of blocks touching the polygon, one dense window is cheaper.
+_SPARSE_MAX_SHARE = 0.8
 
 # Roles marking an asset as a service endpoint rather than a downloadable file.
 _NON_DOWNLOADABLE_ROLES = frozenset({"tiles"})
@@ -78,7 +85,8 @@ def download_items(
         When ``True``, re-encode each file as a COG GeoTIFF
         (``compress=DEFLATE``) through a streamed GDAL copy, with flat memory
         use.  Slower but normalises the output format.  Ignored when an area
-        is given: Subsets are always COGs and other assets are copied as-is.
+        is given: Subsets are COGs (sparse tiled GeoTIFFs for a thin
+        *polygon*) and other assets are copied as-is.
     show_progress:
         Display a ``tqdm`` progress bar.
     extra_aliases:
@@ -100,9 +108,12 @@ def download_items(
         recorded in the metadata GeoPackage as ``subset_bbox``.
     polygon:
         Area of interest as a GeoJSON geometry dict or a Shapely geometry in
-        EPSG:4326, as an alternative to *bbox*.  It is reduced to its bounding
-        box — pixels outside the polygon are not masked — and takes precedence
-        over *bbox*.
+        EPSG:4326, as an alternative to *bbox*; it takes precedence over
+        *bbox*.  The Subset has the shape and grid of the polygon's bounding
+        box, but only the blocks touching the polygon are fetched and written;
+        the rest read as nodata.  Pixels within a written block are not masked,
+        and when the polygon fills most of its bounding box the whole window is
+        written as a COG.  The polygon is recorded as ``subset_polygon``.
 
     Returns
     -------
@@ -121,6 +132,7 @@ def download_items(
         extra_aliases,
         sign,
         _area_bounds(bbox, polygon),
+        _area_polygon(polygon),
     )
     try:
         asyncio.get_running_loop()
@@ -141,6 +153,7 @@ async def _download_items_async(
     extra_aliases: dict[str, list[str]] | None = None,
     sign: Callable[[str], str] | None = None,
     area: tuple[float, ...] | None = None,
+    area_polygon: BaseGeometry | None = None,
 ) -> gpd.GeoDataFrame:
     pm = PathManager(output_dir)
     gdf = gdf.copy()
@@ -175,8 +188,12 @@ async def _download_items_async(
 
         for key, href in selected.items():
             if area is not None and _is_raster(type_by_href.get(href)):
-                dest = pm.subset_path(collection, item_id, item_dt, key, area)
-                tasks.append(_Task(idx, key, href, dest, area, as_cog=True))
+                dest = pm.subset_path(
+                    collection, item_id, item_dt, key, area, area_polygon
+                )
+                tasks.append(
+                    _Task(idx, key, href, dest, area, area_polygon, as_cog=True)
+                )
             else:
                 suffix = _href_suffix(href)
                 dest = pm.asset_path(collection, item_id, item_dt, key, suffix=suffix)
@@ -188,7 +205,7 @@ async def _download_items_async(
     meta_name = (
         f"search_results_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H%M%S')}"
     )
-    _save_metadata(gdf, pm.metadata_path(meta_name), area)
+    _save_metadata(gdf, pm.metadata_path(meta_name), area, area_polygon)
 
     if show_progress and not overwrite:
         _report_existing(tasks)
@@ -229,6 +246,7 @@ class _Task:
     href: str
     dest: Path
     area: tuple[float, ...] | None = None
+    polygon: BaseGeometry | None = None
     as_cog: bool = False
 
 
@@ -245,6 +263,19 @@ def _report_existing(tasks: list[_Task]) -> None:
                 f"Incomplete download ({part.stat().st_size} bytes), "
                 f"will resume: {final}"
             )
+
+
+def _area_polygon(polygon: dict | BaseGeometry | None) -> BaseGeometry | None:
+    """Return *polygon* as a geometry, or ``None`` when it needs no masking.
+
+    A polygon that is its own bounding box masks nothing: it is a plain bbox.
+    """
+    if polygon is None:
+        return None
+    geom = shape(polygon) if isinstance(polygon, dict) else polygon
+    if geom.equals(box(*geom.bounds)):
+        return None
+    return geom
 
 
 def _area_bounds(
@@ -346,7 +377,7 @@ async def _run_downloads(
             async with sem:
                 if task.as_cog:
                     path = await _download_as_cog(
-                        task.href, task.dest, overwrite, sign, task.area
+                        task.href, task.dest, overwrite, sign, task.area, task.polygon
                     )
                 else:
                     path = await _download_raw(
@@ -624,6 +655,7 @@ async def _download_as_cog(
     overwrite: bool = False,
     sign: Callable[[str], str] | None = None,
     area: tuple[float, ...] | None = None,
+    polygon: BaseGeometry | None = None,
 ) -> Path:
     """Write *href*, or its Subset over *area*, as a COG in a worker thread."""
     cog_path = dest.with_suffix(".tif")
@@ -635,7 +667,7 @@ async def _download_as_cog(
     async def attempt_once() -> Path:
         url = await _signed(sign, href)
         try:
-            await asyncio.to_thread(_write_cog, url, cog_path, area)
+            await asyncio.to_thread(_write_cog, url, cog_path, area, polygon)
         except _NoSubset as exc:
             raise DownloadError(f"No Subset for {href}: {exc}") from exc
         except _NoOverlap as exc:
@@ -653,13 +685,18 @@ _GDAL_HTTP_STATUS = re.compile(r"HTTP (?:error|response) code\s*:\s*(\d{3})")
 
 
 def _write_cog(
-    href: str, cog_path: Path, area: tuple[float, ...] | None = None
+    href: str,
+    cog_path: Path,
+    area: tuple[float, ...] | None = None,
+    polygon: BaseGeometry | None = None,
 ) -> None:
     """Copy the raster at *href* to *cog_path* as a COG, with flat memory use.
 
     GDAL streams the copy block by block, so the full array is never held in
     memory.  Data type, nodata and georeferencing are those of the source.
     With *area* (EPSG:4326 bounds), only the Subset covering it is written.
+    With *polygon* too, a Subset that the polygon fills thinly is written as a
+    sparse tiled GeoTIFF holding only the blocks that touch it.
     """
     import rasterio
     from rasterio.errors import RasterioIOError
@@ -672,8 +709,15 @@ def _write_cog(
             if area is None:
                 rio_copy(src, tmp, **options)
             else:
-                with _subset_view(src, area) as view:
-                    rio_copy(view, tmp, **options)
+                blocks = None
+                if polygon is not None:
+                    window = _subset_window(src, area)
+                    blocks = _polygon_blocks(src, window, polygon)
+                if blocks is not None:
+                    _write_sparse(src, window, blocks, tmp)
+                else:
+                    with _subset_view(src, area) as view:
+                        rio_copy(view, tmp, **options)
         tmp.replace(cog_path)
     except (_NoSubset, _NoOverlap):
         raise
@@ -715,6 +759,85 @@ def _subset_window(src, area: tuple[float, ...]):
     if col_end <= col_off or row_end <= row_off:
         raise _NoOverlap("the requested area does not overlap the raster")
     return Window(col_off, row_off, col_end - col_off, row_end - row_off)
+
+
+def _polygon_blocks(src, window, polygon: BaseGeometry):
+    """Return the blocks of *window* worth writing for *polygon*, or ``None``.
+
+    Blocks are ``_SPARSE_BLOCK`` pixels square, as ``(row, col)`` offsets into
+    the window.  A block is kept if it touches *polygon* (EPSG:4326) taken into
+    the raster's CRS, with a margin of one pixel — the test is made there
+    because straight edges in EPSG:4326 are not straight on a projected grid.
+    ``None`` means the polygon covers too much of the window for a sparse
+    Subset to pay off.
+    """
+    import shapely
+    from pyproj import Transformer
+    from shapely.affinity import affine_transform
+    from shapely.ops import transform
+    from shapely.prepared import prep
+
+    to_src = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+    # Densify first: a long edge is curved once projected.
+    dense = shapely.segmentize(polygon, 1e-4)
+    projected = transform(to_src.transform, dense)
+    # To window pixel coordinates, where one pixel is the margin.
+    to_pixels = ~src.window_transform(window)
+    a, b, c, d, e, f = tuple(to_pixels)[:6]
+    pixel_poly = affine_transform(projected, [a, b, d, e, c, f]).buffer(1.0)
+    area = prep(pixel_poly)
+
+    height, width, size = int(window.height), int(window.width), _SPARSE_BLOCK
+    blocks = [
+        (row, col)
+        for row in range(0, height, size)
+        for col in range(0, width, size)
+        if area.intersects(
+            shapely.box(col, row, min(col + size, width), min(row + size, height))
+        )
+    ]
+    total = math.ceil(height / size) * math.ceil(width / size)
+    return None if len(blocks) > _SPARSE_MAX_SHARE * total else blocks
+
+
+def _write_sparse(src, window, blocks, path: Path) -> None:
+    """Write the Subset of *src* over *window* to *path*, only at *blocks*.
+
+    Same grid, CRS and pixels as the dense Subset; the other blocks are left
+    unwritten and read back as nodata.  Not a COG: GDAL's COG driver is dense.
+    """
+    import rasterio
+    from rasterio.windows import Window
+
+    size = _SPARSE_BLOCK
+    profile = {
+        "driver": "GTiff",
+        "width": int(window.width),
+        "height": int(window.height),
+        "count": src.count,
+        "dtype": src.dtypes[0],
+        "crs": src.crs,
+        "transform": src.window_transform(window),
+        "nodata": src.nodata,
+        "tiled": True,
+        "blockxsize": size,
+        "blockysize": size,
+        "compress": "DEFLATE",
+        "bigtiff": "IF_SAFER",
+        "SPARSE_OK": "YES",
+    }
+    with rasterio.open(path, "w", **profile) as dst:
+        for row, col in blocks:
+            block = Window(
+                col,
+                row,
+                min(size, int(window.width) - col),
+                min(size, int(window.height) - row),
+            )
+            source = Window(
+                window.col_off + col, window.row_off + row, block.width, block.height
+            )
+            dst.write(src.read(window=source), window=block)
 
 
 def _subset_view(src, area: tuple[float, ...]):
@@ -761,7 +884,10 @@ def _classify_gdal_error(href: str, exc: Exception) -> Exception:
 
 
 def _save_metadata(
-    gdf: gpd.GeoDataFrame, path: Path, area: tuple[float, ...] | None = None
+    gdf: gpd.GeoDataFrame,
+    path: Path,
+    area: tuple[float, ...] | None = None,
+    polygon: BaseGeometry | None = None,
 ) -> None:
     try:
         serialisable = gdf.drop(
@@ -770,6 +896,8 @@ def _save_metadata(
         )
         if area is not None:
             serialisable["subset_bbox"] = ",".join(repr(v) for v in area)
+        if polygon is not None:
+            serialisable["subset_polygon"] = polygon.wkt
         serialisable.to_file(str(path), driver="GPKG")
     except Exception as exc:
         warnings.warn(f"Failed to save metadata to {path}: {exc}", stacklevel=2)
