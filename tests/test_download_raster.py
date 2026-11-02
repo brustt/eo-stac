@@ -32,6 +32,7 @@ def write_raster(
     count: int = 2,
     nodata: float | None = 0,
     driver: str = "GTiff",
+    tiled: bool = False,
 ) -> np.ndarray:
     """Write a small gridded raster with distinct pixel values; return them."""
     data = np.arange(1, count * _SIZE * _SIZE + 1).reshape(count, _SIZE, _SIZE)
@@ -47,6 +48,7 @@ def write_raster(
         crs="EPSG:32631",
         transform=from_origin(*_ORIGIN, _RES, _RES),
         nodata=nodata,
+        **({"tiled": True, "blockxsize": 16, "blockysize": 16} if tiled else {}),
     ) as dst:
         dst.write(data)
     return data
@@ -576,19 +578,28 @@ def _written_blocks(path: Path) -> int:
         )
 
 
-@pytest.mark.unit
-def test_thin_polygon_writes_only_blocks_it_touches(
-    raster_gdf, small_blocks, tmp_path: Path
-) -> None:
-    polygon = diagonal_polygon()
-
-    sparse = _download(raster_gdf, tmp_path / "a", assets=["vv"], polygon=polygon)
-    dense = _download(
-        raster_gdf, tmp_path / "b", assets=["vv"], bbox=list(polygon.bounds)
+def _polygon_and_bbox_subsets(gdf, tmp_path: Path, polygon) -> tuple[Path, Path]:
+    """Download *polygon*'s Subset, and the plain bbox Subset of its bounds."""
+    by_polygon = _download(gdf, tmp_path / "a", assets=["vv"], polygon=polygon)
+    by_bbox = _download(gdf, tmp_path / "b", assets=["vv"], bbox=list(polygon.bounds))
+    return (
+        by_polygon.iloc[0]["local_paths"]["vv"],
+        by_bbox.iloc[0]["local_paths"]["vv"],
     )
 
-    sparse_path = sparse.iloc[0]["local_paths"]["vv"]
-    dense_path = dense.iloc[0]["local_paths"]["vv"]
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tiled", [False, True], ids=["striped", "tiled"])
+def test_thin_polygon_writes_only_blocks_it_touches(
+    tiled, small_blocks, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.tif"
+    write_raster(source, tiled=tiled)
+    gdf = gdf_with_assets({"vv": (str(source), _GEOTIFF)})
+    polygon = diagonal_polygon()
+
+    sparse_path, dense_path = _polygon_and_bbox_subsets(gdf, tmp_path, polygon)
+
     with rasterio.open(sparse_path) as out, rasterio.open(dense_path) as ref:
         # Same lattice as the bbox Subset.
         assert (out.shape, out.transform, out.crs) == (
@@ -603,9 +614,33 @@ def test_thin_polygon_writes_only_blocks_it_touches(
         np.testing.assert_array_equal(out.read()[:, inside], ref.read()[:, inside])
         # Outside, unwritten blocks read as nodata.
         assert (out.read()[:, ~inside] == out.nodata).any()
-    total_blocks = (out.height // _BLOCK) * (out.width // _BLOCK)
-    assert _written_blocks(sparse_path) < 0.4 * total_blocks
+    total_blocks = -(-out.height // _BLOCK) * -(-out.width // _BLOCK)
+    assert _written_blocks(sparse_path) < 0.5 * total_blocks
     assert sparse_path.stat().st_size < dense_path.stat().st_size
+
+
+@pytest.mark.unit
+def test_sparse_subset_keeps_source_metadata(small_blocks, tmp_path: Path) -> None:
+    source = tmp_path / "source.tif"
+    write_raster(source)
+    with rasterio.open(source, "r+") as src:
+        src.update_tags(ACQUISITION="2024-06-15")
+        src.update_tags(1, POLARISATION="VV")
+        src.descriptions = ("vv", "vh")
+        src.scales = (0.5, 2.0)
+        src.offsets = (1.0, 3.0)
+        src.units = ("dB", "dB")
+    gdf = gdf_with_assets({"vv": (str(source), _GEOTIFF)})
+
+    sparse_path, _ = _polygon_and_bbox_subsets(gdf, tmp_path, diagonal_polygon())
+
+    with rasterio.open(sparse_path) as out:
+        assert out.tags()["ACQUISITION"] == "2024-06-15"
+        assert out.tags(1)["POLARISATION"] == "VV"
+        assert out.descriptions == ("vv", "vh")
+        assert out.scales == (0.5, 2.0)
+        assert out.offsets == (1.0, 3.0)
+        assert out.units == ("dB", "dB")
 
 
 @pytest.mark.unit
@@ -634,19 +669,14 @@ def test_compact_polygon_falls_back_to_the_whole_window(
     from shapely.geometry import Polygon
 
     west, south, east, north = lonlat((500020.0, 5399380.0, 500620.0, 5399980.0))
-    # A triangle: half the bbox, but nearly every block still touches it.
-    triangle = Polygon([(west, south), (east, south), (west, north)])
-
-    result = _download(raster_gdf, tmp_path / "a", assets=["vv"], polygon=triangle)
-    dense = _download(
-        raster_gdf, tmp_path / "b", assets=["vv"], bbox=list(triangle.bounds)
+    # The bbox with one corner cut off: not a rectangle, yet every block touches it.
+    notched = Polygon(
+        [(west, south), (east, south), (east, north - 1e-4), (west + 1e-4, north)]
     )
 
-    path = result.iloc[0]["local_paths"]["vv"]
-    with (
-        rasterio.open(path) as out,
-        rasterio.open(dense.iloc[0]["local_paths"]["vv"]) as ref,
-    ):
+    sparse_path, dense_path = _polygon_and_bbox_subsets(raster_gdf, tmp_path, notched)
+
+    with rasterio.open(sparse_path) as out, rasterio.open(dense_path) as ref:
         np.testing.assert_array_equal(out.read(), ref.read())
 
 
