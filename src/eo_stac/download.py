@@ -45,6 +45,9 @@ _MAX_RETRY_AFTER = 300.0
 # source that is not tiled is cut into squares of _SPARSE_BLOCK pixels instead,
 # and the sparse output is always tiled that size (GDAL wants a multiple of 16).
 _SPARSE_BLOCK = 256
+# How the library writes a COG.
+_COG_OPTIONS = {"driver": "COG", "compress": "DEFLATE", "bigtiff": "IF_SAFER"}
+
 # Above this share of blocks touching the polygon, one dense window is cheaper.
 _SPARSE_MAX_SHARE = 0.9
 
@@ -692,14 +695,13 @@ def _write_cog(href: str, cog_path: Path, area: _Area | None = None) -> None:
     from rasterio.errors import RasterioIOError
     from rasterio.shutil import copy as rio_copy
 
-    options = {"driver": "COG", "compress": "DEFLATE", "bigtiff": "IF_SAFER"}
     tmp = cog_path.with_suffix(cog_path.suffix + ".part")
     try:
         with rasterio.open(href) as src:
             if area is None:
-                rio_copy(src, tmp, **options)
+                rio_copy(src, tmp, **_COG_OPTIONS)
             else:
-                _write_subset(src, area, tmp, options)
+                _write_subset(src, area, tmp)
         tmp.replace(cog_path)
     except (_NoSubset, _NoOverlap):
         raise
@@ -714,8 +716,8 @@ def _write_cog(href: str, cog_path: Path, area: _Area | None = None) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def _subset_window(src, area: tuple[float, ...]):
-    """Return the pixel window of *src* covering *area*, snapped outward.
+def _subset_window(src, bounds: tuple[float, ...]):
+    """Return the pixel window of *src* covering *bounds* (EPSG:4326), snapped outward.
 
     The window is limited to the raster's extent.
     """
@@ -729,7 +731,7 @@ def _subset_window(src, area: tuple[float, ...]):
             "collection"
         )
 
-    bounds = transform_bounds("EPSG:4326", src.crs, *area, densify_pts=21)
+    bounds = transform_bounds("EPSG:4326", src.crs, *bounds, densify_pts=21)
     exact = from_bounds(*bounds, transform=src.transform)
     # Round away float noise before snapping outward to whole source pixels.
     col_off = math.floor(round(exact.col_off, 6))
@@ -743,7 +745,7 @@ def _subset_window(src, area: tuple[float, ...]):
     return Window(col_off, row_off, col_end - col_off, row_end - row_off)
 
 
-def _write_subset(src, area: _Area, path: Path, options: dict) -> None:
+def _write_subset(src, area: _Area, path: Path) -> None:
     """Write the Subset of *src* over *area* to *path*."""
     from rasterio.shutil import copy as rio_copy
 
@@ -755,7 +757,7 @@ def _write_subset(src, area: _Area, path: Path, options: dict) -> None:
         _write_sparse(src, window, tiles, path)
     else:
         with _subset_view(src, window) as view:
-            rio_copy(view, path, **options)
+            rio_copy(view, path, **_COG_OPTIONS)
 
 
 def _window_tiles(src, window) -> list:
