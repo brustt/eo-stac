@@ -66,7 +66,7 @@ src/eo_stac/
 - **Provider-agnostic** — the library names no provider; signing and odd property names come from the caller (`sign`, `extra_query`). See `CONTEXT.md` and `docs/adr/`
 - **Async not threads** — downloads are I/O bound; `asyncio` + `httpx.AsyncClient` avoids thread overhead; all tasks start immediately, bounded by `Semaphore(max_workers)`
 - **Retry only what can succeed** — `_with_retries` makes up to 3 attempts with jittered exponential backoff, honouring `Retry-After`; only connection errors, timeouts and HTTP 408/429/5xx are retried, any other 4xx fails at once; the href is re-signed on every attempt
-- **One COG writer** — `_write_cog` is the single path for every raster the library writes itself (`process=True` and Subsets); Subsets never resample (ADR 0003)
+- **One COG writer** — `_write_cog` is the single entry point for every raster the library writes itself (`process=True` and Subsets); Subsets never resample (ADR 0003). A thin-polygon Subset is the one exception to "COG": `_write_cog` hands it to `_write_sparse`, a sparse tiled GTiff
 - **Server-side filtering only** — sensor filters are pushed via the STAC query extension (`SearchParams.to_query()`); the client never re-filters returned items
 - **COG processing in thread** — `process=True` runs GDAL synchronously in a worker thread via `asyncio.to_thread`; default is raw async streaming for speed
 - **Exception hierarchy** — all errors derive from `EostacError` for easy catch-all handling
