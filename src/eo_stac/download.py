@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 
 import geopandas as gpd
 import httpx
-from shapely.geometry import shape
+from shapely.geometry import box, shape
 from shapely.geometry.base import BaseGeometry
 from tqdm import tqdm
 
@@ -39,6 +39,17 @@ _RASTER_MEDIA_TYPES = ("image/tiff", "image/jp2")
 _RETRYABLE_STATUSES = frozenset({408, 429})
 # Longest Retry-After worth waiting for; beyond it the asset is given up on.
 _MAX_RETRY_AFTER = 300.0
+
+# A polygon Subset reads, and writes, only the blocks touching the polygon.  Those
+# are the source's own tiles, so no read straddles tiles it does not need; a
+# source that is not tiled is cut into squares of _SPARSE_BLOCK pixels instead,
+# and the sparse output is always tiled that size (GDAL wants a multiple of 16).
+_SPARSE_BLOCK = 256
+# How the library writes a COG.
+_COG_OPTIONS = {"driver": "COG", "compress": "DEFLATE", "bigtiff": "IF_SAFER"}
+
+# Above this share of blocks touching the polygon, one dense window is cheaper.
+_SPARSE_MAX_SHARE = 0.9
 
 # Roles marking an asset as a service endpoint rather than a downloadable file.
 _NON_DOWNLOADABLE_ROLES = frozenset({"tiles"})
@@ -78,7 +89,8 @@ def download_items(
         When ``True``, re-encode each file as a COG GeoTIFF
         (``compress=DEFLATE``) through a streamed GDAL copy, with flat memory
         use.  Slower but normalises the output format.  Ignored when an area
-        is given: Subsets are always COGs and other assets are copied as-is.
+        is given: Subsets are COGs (sparse tiled GeoTIFFs for a thin
+        *polygon*) and other assets are copied as-is.
     show_progress:
         Display a ``tqdm`` progress bar.
     extra_aliases:
@@ -100,9 +112,12 @@ def download_items(
         recorded in the metadata GeoPackage as ``subset_bbox``.
     polygon:
         Area of interest as a GeoJSON geometry dict or a Shapely geometry in
-        EPSG:4326, as an alternative to *bbox*.  It is reduced to its bounding
-        box — pixels outside the polygon are not masked — and takes precedence
-        over *bbox*.
+        EPSG:4326, as an alternative to *bbox*; it takes precedence over
+        *bbox*.  The Subset has the shape and grid of the polygon's bounding
+        box, but only the blocks touching the polygon are fetched and written;
+        the rest read as nodata.  Pixels within a written block are not masked,
+        and when the polygon fills most of its bounding box the whole window is
+        written as a COG.  The polygon is recorded as ``subset_polygon``.
 
     Returns
     -------
@@ -120,7 +135,7 @@ def download_items(
         show_progress,
         extra_aliases,
         sign,
-        _area_bounds(bbox, polygon),
+        _make_area(bbox, polygon),
     )
     try:
         asyncio.get_running_loop()
@@ -140,7 +155,7 @@ async def _download_items_async(
     show_progress: bool = True,
     extra_aliases: dict[str, list[str]] | None = None,
     sign: Callable[[str], str] | None = None,
-    area: tuple[float, ...] | None = None,
+    area: _Area | None = None,
 ) -> gpd.GeoDataFrame:
     pm = PathManager(output_dir)
     gdf = gdf.copy()
@@ -175,7 +190,9 @@ async def _download_items_async(
 
         for key, href in selected.items():
             if area is not None and _is_raster(type_by_href.get(href)):
-                dest = pm.subset_path(collection, item_id, item_dt, key, area)
+                dest = pm.subset_path(
+                    collection, item_id, item_dt, key, area.bounds, area.polygon
+                )
                 tasks.append(_Task(idx, key, href, dest, area, as_cog=True))
             else:
                 suffix = _href_suffix(href)
@@ -228,7 +245,7 @@ class _Task:
     key: str
     href: str
     dest: Path
-    area: tuple[float, ...] | None = None
+    area: _Area | None = None
     as_cog: bool = False
 
 
@@ -247,19 +264,32 @@ def _report_existing(tasks: list[_Task]) -> None:
             )
 
 
-def _area_bounds(
+@dataclass(frozen=True)
+class _Area:
+    """The area of interest: EPSG:4326 *bounds*, and the *polygon* inside them.
+
+    *polygon* is ``None`` when the whole bounding box is wanted.
+    """
+
+    bounds: tuple[float, ...]
+    polygon: BaseGeometry | None = None
+
+
+def _make_area(
     bbox: Sequence[float] | None, polygon: dict | BaseGeometry | None
-) -> tuple[float, ...] | None:
-    """Return the area of interest as EPSG:4326 bounds; *polygon* wins."""
+) -> _Area | None:
+    """Return the area of interest; *polygon* wins over *bbox*."""
     if polygon is not None:
         geom = shape(polygon) if isinstance(polygon, dict) else polygon
-        return tuple(float(v) for v in geom.bounds)
+        bounds = tuple(float(v) for v in geom.bounds)
+        # A polygon that is its own bounding box masks nothing.
+        return _Area(bounds, None if geom.equals(box(*bounds)) else geom)
     if bbox is not None:
         if len(bbox) != 4:
             raise ValueError(
                 f"bbox must be [west, south, east, north], got {list(bbox)!r}"
             )
-        return tuple(float(v) for v in bbox)
+        return _Area(tuple(float(v) for v in bbox))
     return None
 
 
@@ -623,7 +653,7 @@ async def _download_as_cog(
     dest: Path,
     overwrite: bool = False,
     sign: Callable[[str], str] | None = None,
-    area: tuple[float, ...] | None = None,
+    area: _Area | None = None,
 ) -> Path:
     """Write *href*, or its Subset over *area*, as a COG in a worker thread."""
     cog_path = dest.with_suffix(".tif")
@@ -652,28 +682,26 @@ async def _download_as_cog(
 _GDAL_HTTP_STATUS = re.compile(r"HTTP (?:error|response) code\s*:\s*(\d{3})")
 
 
-def _write_cog(
-    href: str, cog_path: Path, area: tuple[float, ...] | None = None
-) -> None:
+def _write_cog(href: str, cog_path: Path, area: _Area | None = None) -> None:
     """Copy the raster at *href* to *cog_path* as a COG, with flat memory use.
 
     GDAL streams the copy block by block, so the full array is never held in
     memory.  Data type, nodata and georeferencing are those of the source.
-    With *area* (EPSG:4326 bounds), only the Subset covering it is written.
+    With *area*, only the Subset covering it is written; if the area has a
+    polygon that fills the Subset thinly, a sparse tiled GeoTIFF holding only
+    the blocks that touch the polygon.
     """
     import rasterio
     from rasterio.errors import RasterioIOError
     from rasterio.shutil import copy as rio_copy
 
-    options = {"driver": "COG", "compress": "DEFLATE", "bigtiff": "IF_SAFER"}
     tmp = cog_path.with_suffix(cog_path.suffix + ".part")
     try:
         with rasterio.open(href) as src:
             if area is None:
-                rio_copy(src, tmp, **options)
+                rio_copy(src, tmp, **_COG_OPTIONS)
             else:
-                with _subset_view(src, area) as view:
-                    rio_copy(view, tmp, **options)
+                _write_subset(src, area, tmp)
         tmp.replace(cog_path)
     except (_NoSubset, _NoOverlap):
         raise
@@ -688,8 +716,8 @@ def _write_cog(
         tmp.unlink(missing_ok=True)
 
 
-def _subset_window(src, area: tuple[float, ...]):
-    """Return the pixel window of *src* covering *area*, snapped outward.
+def _subset_window(src, bounds: tuple[float, ...]):
+    """Return the pixel window of *src* covering *bounds* (EPSG:4326), snapped outward.
 
     The window is limited to the raster's extent.
     """
@@ -703,7 +731,7 @@ def _subset_window(src, area: tuple[float, ...]):
             "collection"
         )
 
-    bounds = transform_bounds("EPSG:4326", src.crs, *area, densify_pts=21)
+    bounds = transform_bounds("EPSG:4326", src.crs, *bounds, densify_pts=21)
     exact = from_bounds(*bounds, transform=src.transform)
     # Round away float noise before snapping outward to whole source pixels.
     col_off = math.floor(round(exact.col_off, 6))
@@ -717,8 +745,139 @@ def _subset_window(src, area: tuple[float, ...]):
     return Window(col_off, row_off, col_end - col_off, row_end - row_off)
 
 
-def _subset_view(src, area: tuple[float, ...]):
-    """Return a dataset exposing only the Subset of *src* over *area*.
+def _write_subset(src, area: _Area, path: Path) -> None:
+    """Write the Subset of *src* over *area* to *path*."""
+    from rasterio.shutil import copy as rio_copy
+
+    window = _subset_window(src, area.bounds)
+    tiles = None
+    if area.polygon is not None:
+        tiles = _tiles_touching(src, window, area.polygon)
+    if tiles is not None:
+        _write_sparse(src, window, tiles, path)
+    else:
+        with _subset_view(src, window) as view:
+            rio_copy(view, path, **_COG_OPTIONS)
+
+
+def _window_tiles(src, window) -> list:
+    """Cut *window* along the source's block grid, as windows relative to it.
+
+    Reading one such tile touches exactly one block of the source.  A source
+    that is not tiled has no useful grid: it is cut into ``_SPARSE_BLOCK`` squares.
+    """
+    from rasterio.windows import Window
+
+    if src.profile.get("tiled"):
+        rows, cols = src.block_shapes[0]
+    else:
+        rows = cols = _SPARSE_BLOCK
+    col0, row0 = int(window.col_off), int(window.row_off)
+    col1, row1 = col0 + int(window.width), row0 + int(window.height)
+    tiles = []
+    for top in range(row0 // rows * rows, row1, rows):
+        for left in range(col0 // cols * cols, col1, cols):
+            r0, c0 = max(top, row0), max(left, col0)
+            r1, c1 = min(top + rows, row1), min(left + cols, col1)
+            tiles.append(Window(c0 - col0, r0 - row0, c1 - c0, r1 - r0))
+    return tiles
+
+
+def _polygon_in_pixels(src, window, polygon: BaseGeometry) -> BaseGeometry:
+    """Return *polygon* (EPSG:4326) in the pixel coordinates of *window*.
+
+    It is projected into the raster's CRS first: straight edges in EPSG:4326 are
+    not straight on a projected grid, so the polygon is densified before.
+    """
+    import shapely
+    from pyproj import Transformer
+    from shapely.affinity import affine_transform
+    from shapely.ops import transform
+
+    to_src = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+    projected = transform(to_src.transform, shapely.segmentize(polygon, 1e-4))
+    a, b, c, d, e, f = tuple(~src.window_transform(window))[:6]
+    return affine_transform(projected, [a, b, d, e, c, f])
+
+
+def _tiles_touching(src, window, polygon: BaseGeometry):
+    """Return the tiles of *window* worth writing for *polygon*, or ``None``.
+
+    A tile is kept if it touches *polygon* with a margin of one pixel.  ``None``
+    means the polygon covers so much of the window (``_SPARSE_MAX_SHARE``) that
+    a dense Subset is the better choice.
+    """
+    import shapely
+    from shapely.prepared import prep
+
+    footprint = prep(_polygon_in_pixels(src, window, polygon).buffer(1.0))
+    tiles = _window_tiles(src, window)
+    kept = [
+        t
+        for t in tiles
+        if footprint.intersects(
+            shapely.box(t.col_off, t.row_off, t.col_off + t.width, t.row_off + t.height)
+        )
+    ]
+    return None if len(kept) > _SPARSE_MAX_SHARE * len(tiles) else kept
+
+
+def _write_sparse(src, window, tiles, path: Path) -> None:
+    """Write the Subset of *src* over *window* to *path*, only at *tiles*.
+
+    Same grid, CRS, pixels and metadata as the dense Subset; the other blocks
+    are left unwritten and read back as nodata.  Not a COG: GDAL's COG driver is
+    dense.
+    """
+    import rasterio
+    from rasterio.windows import Window
+
+    profile = {
+        "driver": "GTiff",
+        "width": int(window.width),
+        "height": int(window.height),
+        "count": src.count,
+        "dtype": src.dtypes[0],
+        "crs": src.crs,
+        "transform": src.window_transform(window),
+        "nodata": src.nodata,
+        "tiled": True,
+        "blockxsize": _SPARSE_BLOCK,
+        "blockysize": _SPARSE_BLOCK,
+        "compress": "DEFLATE",
+        "bigtiff": "IF_SAFER",
+        "SPARSE_OK": "YES",
+    }
+    with rasterio.open(path, "w", **profile) as dst:
+        _copy_metadata(src, dst)
+        for tile in tiles:
+            source = Window(
+                window.col_off + tile.col_off,
+                window.row_off + tile.row_off,
+                tile.width,
+                tile.height,
+            )
+            dst.write(src.read(window=source), window=tile)
+
+
+def _copy_metadata(src, dst) -> None:
+    """Carry the dataset and band metadata of *src* over to *dst*."""
+    from rasterio.enums import ColorInterp
+
+    dst.update_tags(**src.tags())
+    dst.descriptions = src.descriptions
+    dst.scales = src.scales
+    dst.offsets = src.offsets
+    dst.units = src.units
+    dst.colorinterp = src.colorinterp
+    for band in src.indexes:
+        dst.update_tags(band, **src.tags(band))
+        if src.colorinterp[band - 1] == ColorInterp.palette:
+            dst.write_colormap(band, src.colormap(band))
+
+
+def _subset_view(src, window):
+    """Return a dataset exposing only the Subset of *src* over *window*.
 
     The view sits on the source pixel grid, in the source CRS, so nearest-
     neighbour lookup returns each source pixel unchanged: nothing is resampled
@@ -727,7 +886,6 @@ def _subset_view(src, area: tuple[float, ...]):
     from rasterio.enums import Resampling
     from rasterio.vrt import WarpedVRT
 
-    window = _subset_window(src, area)
     return WarpedVRT(
         src,
         crs=src.crs,
@@ -761,7 +919,9 @@ def _classify_gdal_error(href: str, exc: Exception) -> Exception:
 
 
 def _save_metadata(
-    gdf: gpd.GeoDataFrame, path: Path, area: tuple[float, ...] | None = None
+    gdf: gpd.GeoDataFrame,
+    path: Path,
+    area: _Area | None = None,
 ) -> None:
     try:
         serialisable = gdf.drop(
@@ -769,7 +929,9 @@ def _save_metadata(
             errors="ignore",
         )
         if area is not None:
-            serialisable["subset_bbox"] = ",".join(repr(v) for v in area)
+            serialisable["subset_bbox"] = ",".join(repr(v) for v in area.bounds)
+            if area.polygon is not None:
+                serialisable["subset_polygon"] = area.polygon.wkt
         serialisable.to_file(str(path), driver="GPKG")
     except Exception as exc:
         warnings.warn(f"Failed to save metadata to {path}: {exc}", stacklevel=2)

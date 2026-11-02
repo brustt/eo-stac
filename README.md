@@ -135,8 +135,8 @@ gdf = download_items(gdf, "downloads/", assets=["vv"], bbox=[2.2, 48.8, 2.5, 48.
 ```
 
 - A Subset is never resampled. It keeps the source pixels, CRS, resolution, data type and nodata, so it is slightly larger than the area and is not in EPSG:4326.
-- A polygon is reduced to its bounding box; pixels outside it are not masked.
-- The file name carries a tag derived from the area, so Subsets of different areas and the whole file coexist. The area is recorded as `subset_bbox` in the metadata GeoPackage.
+- With `polygon`, the Subset keeps the full window shape and grid of the bbox Subset, but only the blocks touching the polygon are fetched and written (the source's own tiles, or 256 px squares if it is not tiled); the others read back as the raster's nodata and cost no transfer or disk. The polygon is tested in the raster's CRS with a one-pixel margin. Pixels inside the polygon are identical to the bbox Subset. Such a Subset is a sparse tiled GeoTIFF, not a COG; it keeps the source's tags, band descriptions, scale/offset, units, colour interpretation and colormap. When the polygon touches more than 90% of the blocks (or fills its bbox), the ordinary dense COG is written instead. Pixels in a touched block but outside the polygon are real source pixels, not masked. A source without a nodata value has no value to read unwritten blocks as: they read as 0.
+- The file name carries a tag derived from the area, so Subsets of different areas and the whole file coexist. The area is recorded as `subset_bbox` in the metadata GeoPackage, and a polygon that limits the Subset as `subset_polygon` (WKT); Skip-existing never reuses a Subset made for a different polygon.
 - An area that only partly overlaps a raster gives the overlapping part. No overlap skips that asset with a warning.
 - Rasters georeferenced only by ground control points, such as Sentinel-1 GRD, have no Subset and are reported as failed. Download the whole file, or use a gridded collection such as `sentinel-1-rtc`.
 - Non-raster assets (thumbnails, XML, manifests) are transferred whole.

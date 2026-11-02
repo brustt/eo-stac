@@ -7,6 +7,9 @@ from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
+import shapely
+from shapely.geometry.base import BaseGeometry
+
 from eo_stac.exceptions import StorageError
 
 
@@ -54,15 +57,17 @@ class PathManager:
         date: datetime | None,
         asset_key: str,
         area: Sequence[float],
+        polygon: BaseGeometry | None = None,
     ) -> Path:
         """Return the path for a Subset of an asset over *area*.
 
         *area* is ``(west, south, east, north)`` in EPSG:4326.  The file name
-        carries a tag derived from it, so Subsets of different areas and the
+        carries a tag derived from it — and from *polygon*, the EPSG:4326
+        shape the Subset is limited to — so Subsets of different areas and the
         whole file never share a path.
         """
         directory = self.item_dir(collection, item_id, date)
-        return directory / f"{item_id}_{asset_key}_sub-{_area_tag(area)}.tif"
+        return directory / f"{item_id}_{asset_key}_sub-{_area_tag(area, polygon)}.tif"
 
     def metadata_path(self, name: str) -> Path:
         """Return the path for a GeoPackage metadata file."""
@@ -76,7 +81,9 @@ class PathManager:
         return meta_dir / f"{name}.gpkg"
 
 
-def _area_tag(area: Sequence[float]) -> str:
+def _area_tag(area: Sequence[float], polygon: BaseGeometry | None = None) -> str:
     """Short, stable identifier of an area (coordinates rounded to ~1 cm)."""
     canonical = ",".join(f"{float(v):.7f}" for v in area)
+    if polygon is not None:
+        canonical += "|" + shapely.to_wkt(polygon, rounding_precision=7)
     return hashlib.sha1(canonical.encode()).hexdigest()[:8]
